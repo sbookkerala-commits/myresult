@@ -42,6 +42,10 @@ router.get('/restore', authRequired, async (req, res) => {
     const settings = {};
     for (const d of settingsDocs) settings[d.key] = d.value;
 
+    console.log(
+      `[restore] user=${req.user.username} role=${req.user.role} bookings=${bookings.length}`
+    );
+
     res.json({
       bookings: bookings.map((b) => ({
         billNo: b.billNo,

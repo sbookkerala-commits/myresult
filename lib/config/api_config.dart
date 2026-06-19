@@ -4,7 +4,7 @@ import 'package:flutter/foundation.dart' show debugPrint;
 class ApiConfig {
   static const String productionBaseUrl = String.fromEnvironment(
     'API_BASE_URL',
-    defaultValue: 'https://myresult-api.onrender.com',
+    defaultValue: 'https://myresult-zu6v.onrender.com',
   );
 
   static String get baseUrl => productionBaseUrl.replaceAll(RegExp(r'/$'), '');

@@ -47,8 +47,38 @@ class ApiService {
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
 
-  static Future<void> postBooking(Map<String, dynamic> payload) async {
-    await _post('/api/bookings', payload);
+  static Future<List<Map<String, dynamic>>> getBookings() async {
+    final res = await http
+        .get(
+          Uri.parse('${ApiConfig.baseUrl}/api/bookings'),
+          headers: _headers,
+        )
+        .timeout(ApiConfig.timeout);
+    if (res.statusCode != 200) {
+      throw ApiException('Fetch bookings failed (${res.statusCode})');
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final items = data['items'];
+    if (items is! List) return [];
+    return items
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+  }
+
+  static Future<int> postBooking(Map<String, dynamic> payload) async {
+    final res = await http
+        .post(
+          Uri.parse('${ApiConfig.baseUrl}/api/bookings'),
+          headers: _headers,
+          body: jsonEncode(payload),
+        )
+        .timeout(ApiConfig.timeout);
+    if (res.statusCode >= 400) {
+      final decoded = jsonDecode(res.body);
+      final msg = decoded is Map ? decoded['error']?.toString() : null;
+      throw ApiException(msg ?? 'Booking save failed (${res.statusCode})');
+    }
+    return res.statusCode;
   }
 
   static Future<void> deleteBooking(int billNo) async {
@@ -100,7 +130,7 @@ class ApiService {
     try {
       final res = await http
           .get(Uri.parse('${ApiConfig.baseUrl}/health'))
-          .timeout(const Duration(seconds: 5));
+          .timeout(const Duration(seconds: 15));
       return res.statusCode == 200;
     } catch (_) {
       return false;

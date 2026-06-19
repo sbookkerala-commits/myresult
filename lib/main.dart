@@ -615,8 +615,13 @@ class BillsStore {
 
   static void add(BillRecord r) {
     bills.value = [r, ...bills.value];
-    _scheduleSave();
-    unawaited(SyncService.queueBooking(r.toJson()));
+    unawaited(_persistAndSyncBooking(r));
+  }
+
+  static Future<void> _persistAndSyncBooking(BillRecord r) async {
+    await saveNow();
+    debugPrint('Booking saved local: billNo=${r.billNo}');
+    await SyncService.syncBooking(r.toJson());
   }
 
   static BillRecord? byBillNo(int no) {
@@ -629,15 +634,20 @@ class BillsStore {
 
   static void delete(int no) {
     bills.value = bills.value.where((b) => b.billNo != no).toList();
-    _scheduleSave();
-    unawaited(SyncService.queueBookingDelete(no));
+    unawaited(_persistAndSyncDelete(no));
+  }
+
+  static Future<void> _persistAndSyncDelete(int no) async {
+    await saveNow();
+    await SyncService.queueBookingDelete(no);
   }
 
   static void notifyUpdated([BillRecord? bill]) {
     bills.value = [...bills.value];
-    _scheduleSave();
     if (bill != null) {
-      unawaited(SyncService.queueBooking(bill.toJson()));
+      unawaited(_persistAndSyncBooking(bill));
+    } else {
+      _scheduleSave();
     }
   }
 }
@@ -741,19 +751,51 @@ class ResultStore {
   }
 }
 
+/// Merge cloud bookings into local SQLite (cloud wins on same billNo).
+Future<void> _mergeCloudBookings(List<dynamic> bookingsRaw) async {
+  debugPrint('Restore bookings count (cloud): ${bookingsRaw.length}');
+
+  final byBillNo = <int, BillRecord>{
+    for (final b in BillsStore.bills.value) b.billNo: b,
+  };
+
+  var parsed = 0;
+  for (final item in bookingsRaw) {
+    if (item is! Map) continue;
+    final b = BillRecord.fromJson(Map<String, dynamic>.from(item));
+    if (b != null) {
+      byBillNo[b.billNo] = b;
+      parsed++;
+    }
+  }
+
+  final merged = byBillNo.values.toList()
+    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+  BillsStore.bills.value = merged;
+  await BillsStore.saveNow();
+  debugPrint(
+    'SQLite inserted bookings count: ${merged.length} (parsed from cloud: $parsed)',
+  );
+}
+
 /// Merge cloud restore payload into local stores (after login).
 Future<void> applyCloudRestore(Map<String, dynamic> data) async {
   final bookings = data['bookings'];
-  if (bookings is List && bookings.isNotEmpty) {
-    final loaded = <BillRecord>[];
-    for (final item in bookings) {
-      final b = BillRecord.fromJson(Map<String, dynamic>.from(item as Map));
-      if (b != null) loaded.add(b);
+  if (bookings is List) {
+    await _mergeCloudBookings(bookings);
+  } else {
+    debugPrint('Restore bookings: missing or invalid');
+  }
+
+  try {
+    final items = await ApiService.getBookings();
+    debugPrint('GET /api/bookings count: ${items.length}');
+    if (items.isNotEmpty) {
+      await _mergeCloudBookings(items);
     }
-    if (loaded.isNotEmpty) {
-      BillsStore.bills.value = loaded;
-      await BillsStore.saveNow();
-    }
+  } catch (e) {
+    debugPrint('GET /api/bookings failed: $e');
   }
 
   final salesRaw = data['sales'];
@@ -1056,8 +1098,21 @@ class _LoginPageState extends State<LoginPage> {
       );
 
       try {
-        final data = await SyncService.restoreFromCloud();
-        await applyCloudRestore(data);
+        Map<String, dynamic>? data;
+        for (var attempt = 1; attempt <= 3; attempt++) {
+          try {
+            data = await SyncService.restoreFromCloud();
+            break;
+          } catch (e) {
+            debugPrint('Cloud restore attempt $attempt failed: $e');
+            if (attempt < 3) {
+              await Future.delayed(const Duration(seconds: 3));
+            }
+          }
+        }
+        if (data != null) {
+          await applyCloudRestore(data);
+        }
         await SyncService.flushQueue();
       } catch (e) {
         debugPrint('Cloud restore skipped: $e');

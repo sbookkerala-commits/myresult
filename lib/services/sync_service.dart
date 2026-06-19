@@ -24,7 +24,7 @@ class SyncService {
       final connected = results.any((r) => r != ConnectivityResult.none);
       if (connected) {
         isOnline = await ApiService.healthCheck();
-        if (isOnline) await flushQueue();
+        if (isOnline && ApiService.token != null) await flushQueue();
       } else {
         isOnline = false;
       }
@@ -75,9 +75,31 @@ class SyncService {
     }
   }
 
+  static Future<bool> _canSync() async {
+    isOnline = await ApiService.healthCheck();
+    return isOnline && ApiService.token != null;
+  }
+
+  static Future<void> syncBooking(Map<String, dynamic> billJson) async {
+    final billNo = billJson['billNo'];
+    if (!await _canSync()) {
+      await OfflineQueue.enqueue(QueueOp.booking, billJson);
+      debugPrint('Booking queued offline: billNo=$billNo');
+      return;
+    }
+    try {
+      final statusCode = await ApiService.postBooking(billJson);
+      debugPrint(
+        'Booking POST cloud statusCode=$statusCode billNo=$billNo',
+      );
+    } catch (e) {
+      debugPrint('Booking POST cloud failed billNo=$billNo: $e');
+      await OfflineQueue.enqueue(QueueOp.booking, billJson);
+    }
+  }
+
   static Future<void> queueBooking(Map<String, dynamic> billJson) async {
-    await OfflineQueue.enqueue(QueueOp.booking, billJson);
-    await flushQueue();
+    await syncBooking(billJson);
   }
 
   static Future<void> queueBookingDelete(int billNo) async {
@@ -101,10 +123,11 @@ class SyncService {
   }
 
   static Future<void> flushQueue() async {
-    isOnline = await ApiService.healthCheck();
-    if (!isOnline || ApiService.token == null) return;
+    if (!await _canSync()) return;
 
     final pending = await OfflineQueue.drain();
+    if (pending.isEmpty) return;
+
     final failed = <Map<String, dynamic>>[];
 
     for (final item in pending) {
@@ -113,10 +136,15 @@ class SyncService {
         final payload = Map<String, dynamic>.from(item['payload'] as Map);
         switch (op) {
           case 'booking':
-            await ApiService.postBooking(payload);
+            final statusCode = await ApiService.postBooking(payload);
+            debugPrint(
+              'Queue booking POST statusCode=$statusCode billNo=${payload['billNo']}',
+            );
             break;
           case 'bookingDelete':
-            await ApiService.deleteBooking(payload['billNo'] as int);
+            final rawNo = payload['billNo'];
+            final billNo = rawNo is int ? rawNo : int.parse(rawNo.toString());
+            await ApiService.deleteBooking(billNo);
             break;
           case 'sale':
             await ApiService.postSale(payload);
@@ -150,6 +178,7 @@ class SyncService {
           Map<String, dynamic>.from(f['payload'] as Map),
         );
       }
+      debugPrint('Sync queue re-queued ${failed.length} failed item(s)');
     }
   }
 }

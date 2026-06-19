@@ -10,6 +10,11 @@ function ownerFilter(req) {
   return { ownerUsername: req.user.username };
 }
 
+function upsertFilter(req, billNo) {
+  if (req.user.role === 'ADMIN') return { billNo };
+  return { billNo, ownerUsername: req.user.username };
+}
+
 router.get('/', authRequired, async (req, res) => {
   try {
     const cutoff = retentionCutoff();
@@ -19,6 +24,9 @@ router.get('/', authRequired, async (req, res) => {
       ...ownerFilter(req),
     };
     const items = await Booking.find(filter).sort({ createdAt: -1 }).lean();
+    console.log(
+      `[bookings] GET user=${req.user.username} role=${req.user.role} count=${items.length}`
+    );
     res.json({
       items: items.map((b) => ({
         billNo: b.billNo,
@@ -54,9 +62,13 @@ router.post('/', authRequired, async (req, res) => {
     };
 
     const saved = await Booking.findOneAndUpdate(
-      { billNo, ownerUsername: req.user.username },
+      upsertFilter(req, billNo),
       { $set: doc },
       { upsert: true, new: true }
+    );
+
+    console.log(
+      `[bookings] POST user=${req.user.username} role=${req.user.role} billNo=${saved.billNo}`
     );
 
     res.status(201).json({
