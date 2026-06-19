@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: myresult-api
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: USE_EMBEDDED_MONGO
+        value: false
+      - key: HOST
+        value: 0.0.0.0
+      - key: RETENTION_DAYS
+        value: 21
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
