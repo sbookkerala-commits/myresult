@@ -40,7 +40,7 @@ class ApiService {
           Uri.parse('${ApiConfig.baseUrl}/api/sync/restore'),
           headers: _headers,
         )
-        .timeout(ApiConfig.timeout);
+        .timeout(ApiConfig.restoreTimeout);
     if (res.statusCode != 200) {
       throw ApiException('Restore failed (${res.statusCode})');
     }
@@ -53,7 +53,7 @@ class ApiService {
           Uri.parse('${ApiConfig.baseUrl}/api/bookings'),
           headers: _headers,
         )
-        .timeout(ApiConfig.timeout);
+        .timeout(ApiConfig.restoreTimeout);
     if (res.statusCode != 200) {
       throw ApiException('Fetch bookings failed (${res.statusCode})');
     }

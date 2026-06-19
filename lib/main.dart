@@ -90,15 +90,19 @@ class LegacyPrefs {
   }
 }
 
-DateTime _calendarDate(DateTime d) => DateTime(d.year, d.month, d.day);
+DateTime _calendarDate(DateTime d) {
+  final local = d.toLocal();
+  return DateTime(local.year, local.month, local.day);
+}
 
 String formatBillDateTime(DateTime dt) {
-  final int hour12 = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
-  final String ampm = dt.hour >= 12 ? "PM" : "AM";
-  final d = dt.day.toString().padLeft(2, "0");
-  final m = dt.month.toString().padLeft(2, "0");
-  final y = dt.year;
-  return "$d/$m/$y $hour12:${dt.minute.toString().padLeft(2, "0")} $ampm";
+  final local = dt.toLocal();
+  final int hour12 = local.hour % 12 == 0 ? 12 : local.hour % 12;
+  final String ampm = local.hour >= 12 ? "PM" : "AM";
+  final d = local.day.toString().padLeft(2, "0");
+  final m = local.month.toString().padLeft(2, "0");
+  final y = local.year;
+  return "$d/$m/$y $hour12:${local.minute.toString().padLeft(2, "0")} $ampm";
 }
 
 /// Default report window: today (user can widen the range if needed).
@@ -525,7 +529,7 @@ class BillRecord {
 
   Map<String, dynamic> toJson() => {
         "billNo": billNo,
-        "createdAt": createdAt.toIso8601String(),
+        "createdAt": createdAt.toUtc().toIso8601String(),
         "username": username,
         "rows": rows.map((r) => Map<String, dynamic>.from(r)).toList(),
       };
@@ -535,9 +539,10 @@ class BillRecord {
     final billRaw = json["billNo"];
     final int? billNo =
         billRaw is int ? billRaw : int.tryParse(billRaw.toString());
-    final created = DateTime.tryParse(json["createdAt"]?.toString() ?? "");
+    final parsedCreated = DateTime.tryParse(json["createdAt"]?.toString() ?? "");
     final username = json["username"]?.toString() ?? "";
-    if (billNo == null || created == null) return null;
+    if (billNo == null || parsedCreated == null) return null;
+    final created = parsedCreated.toLocal();
 
     final rowsRaw = json["rows"];
     if (rowsRaw is! List) return null;
@@ -748,6 +753,18 @@ class ResultStore {
     results.value = map;
     _scheduleSave();
     unawaited(SyncService.queueResult(snapshot.toJson()));
+  }
+}
+
+/// Pull latest bookings from cloud and merge into SQLite.
+Future<void> pullBookingsFromCloud() async {
+  if (ApiService.token == null) return;
+  try {
+    final items = await ApiService.getBookings();
+    debugPrint('Pull bookings from cloud count: ${items.length}');
+    await _mergeCloudBookings(items);
+  } catch (e) {
+    debugPrint('Pull bookings from cloud failed: $e');
   }
 }
 
@@ -1106,7 +1123,7 @@ class _LoginPageState extends State<LoginPage> {
           } catch (e) {
             debugPrint('Cloud restore attempt $attempt failed: $e');
             if (attempt < 3) {
-              await Future.delayed(const Duration(seconds: 3));
+              await Future.delayed(const Duration(seconds: 4));
             }
           }
         }
@@ -1114,8 +1131,10 @@ class _LoginPageState extends State<LoginPage> {
           await applyCloudRestore(data);
         }
         await SyncService.flushQueue();
+        await pullBookingsFromCloud();
       } catch (e) {
         debugPrint('Cloud restore skipped: $e');
+        await pullBookingsFromCloud();
       }
 
       if (mounted) Navigator.pop(context);
@@ -1234,9 +1253,22 @@ class _LoginPageState extends State<LoginPage> {
   }
 }
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   final String username;
   const HomePage({super.key, required this.username});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(pullBookingsFromCloud());
+    });
+  }
 
   void _openDrawPicker(BuildContext context) {
     showModalBottomSheet<void>(
@@ -1258,10 +1290,10 @@ class HomePage extends StatelessWidget {
                 ),
               ),
             ),
-            ticketButton(ctx, "DEAR 1 PM", const Color(0xFF1565C0), username),
-            ticketButton(ctx, "LSK 3 PM", const Color(0xFF2E7D32), username),
-            ticketButton(ctx, "DEAR 6 PM", const Color(0xFF6A1B9A), username),
-            ticketButton(ctx, "DEAR 8 PM", const Color(0xFFAD1457), username),
+            ticketButton(ctx, "DEAR 1 PM", const Color(0xFF1565C0), widget.username),
+            ticketButton(ctx, "LSK 3 PM", const Color(0xFF2E7D32), widget.username),
+            ticketButton(ctx, "DEAR 6 PM", const Color(0xFF6A1B9A), widget.username),
+            ticketButton(ctx, "DEAR 8 PM", const Color(0xFFAD1457), widget.username),
             const SizedBox(height: 8),
           ],
         ),
@@ -1277,7 +1309,7 @@ class HomePage extends StatelessWidget {
         decoration: _reportPageBgDecoration(),
         child: Scaffold(
           backgroundColor: Colors.transparent,
-          appBar: _reportAppBar(username, context),
+          appBar: _reportAppBar(widget.username, context),
           body: ListView(
             padding: const EdgeInsets.symmetric(vertical: 8),
             children: [

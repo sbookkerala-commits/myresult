@@ -9,7 +9,8 @@ class ApiConfig {
 
   static String get baseUrl => productionBaseUrl.replaceAll(RegExp(r'/$'), '');
 
-  static const Duration timeout = Duration(seconds: 25);
+  static const Duration timeout = Duration(seconds: 45);
+  static const Duration restoreTimeout = Duration(seconds: 60);
 
   static Future<void> init() async {
     debugPrint('API base URL: $baseUrl');
