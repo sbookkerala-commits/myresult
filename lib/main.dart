@@ -105,8 +105,11 @@ String formatBillDateTime(DateTime dt) {
   return "$d/$m/$y $hour12:${local.minute.toString().padLeft(2, "0")} $ampm";
 }
 
-/// Default report window: today (user can widen the range if needed).
-DateTime defaultReportFromDate() => _calendarDate(DateTime.now());
+/// Default report window: last 21 days (matches cloud retention).
+DateTime defaultReportFromDate() {
+  final today = _calendarDate(DateTime.now());
+  return today.subtract(const Duration(days: 20));
+}
 
 DateTime defaultReportToDate() => _calendarDate(DateTime.now());
 
@@ -537,9 +540,12 @@ class BillRecord {
   static BillRecord? fromJson(Map<String, dynamic>? json) {
     if (json == null) return null;
     final billRaw = json["billNo"];
-    final int? billNo =
-        billRaw is int ? billRaw : int.tryParse(billRaw.toString());
-    final parsedCreated = DateTime.tryParse(json["createdAt"]?.toString() ?? "");
+    final int? billNo = billRaw is int
+        ? billRaw
+        : billRaw is num
+            ? billRaw.toInt()
+            : int.tryParse(billRaw?.toString() ?? "");
+    final parsedCreated = _parseDateTime(json["createdAt"]);
     final username = json["username"]?.toString() ?? "";
     if (billNo == null || parsedCreated == null) return null;
     final created = parsedCreated.toLocal();
@@ -561,6 +567,16 @@ class BillRecord {
     }
     return BillRecord(
         billNo: billNo, createdAt: created, rows: rows, username: username);
+  }
+
+  static DateTime? _parseDateTime(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is String) return DateTime.tryParse(raw);
+    if (raw is Map) {
+      final nested = raw[r'$date'] ?? raw['date'];
+      if (nested != null) return DateTime.tryParse(nested.toString());
+    }
+    return DateTime.tryParse(raw.toString());
   }
 
   int get totalCount => rows.fold<int>(
@@ -756,64 +772,64 @@ class ResultStore {
   }
 }
 
-/// Pull latest bookings from cloud and merge into SQLite.
-Future<void> pullBookingsFromCloud() async {
-  if (ApiService.token == null) return;
-  try {
-    final items = await ApiService.getBookings();
-    debugPrint('Pull bookings from cloud count: ${items.length}');
-    await _mergeCloudBookings(items);
-  } catch (e) {
-    debugPrint('Pull bookings from cloud failed: $e');
-  }
-}
+/// Replace local bookings with cloud data (source of truth).
+Future<void> _replaceCloudBookings(List<dynamic> bookingsRaw) async {
+  debugPrint('Replace bookings from cloud count: ${bookingsRaw.length}');
 
-/// Merge cloud bookings into local SQLite (cloud wins on same billNo).
-Future<void> _mergeCloudBookings(List<dynamic> bookingsRaw) async {
-  debugPrint('Restore bookings count (cloud): ${bookingsRaw.length}');
-
-  final byBillNo = <int, BillRecord>{
-    for (final b in BillsStore.bills.value) b.billNo: b,
-  };
-
+  final loaded = <BillRecord>[];
   var parsed = 0;
   for (final item in bookingsRaw) {
     if (item is! Map) continue;
-    final b = BillRecord.fromJson(Map<String, dynamic>.from(item));
+    final map = Map<String, dynamic>.from(item);
+    final b = BillRecord.fromJson(map);
     if (b != null) {
-      byBillNo[b.billNo] = b;
+      loaded.add(b);
       parsed++;
+    } else {
+      debugPrint('Booking parse failed: $map');
     }
   }
 
-  final merged = byBillNo.values.toList()
-    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
-
-  BillsStore.bills.value = merged;
+  loaded.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  BillsStore.bills.value = loaded;
   await BillsStore.saveNow();
   debugPrint(
-    'SQLite inserted bookings count: ${merged.length} (parsed from cloud: $parsed)',
+    'SQLite bookings replaced: ${loaded.length} (parsed: $parsed)',
   );
+}
+
+/// Pull latest bookings from cloud with retries.
+Future<void> pullBookingsFromCloud() async {
+  if (ApiService.token == null) {
+    debugPrint('Pull bookings skipped: no auth token');
+    return;
+  }
+
+  for (var attempt = 1; attempt <= 3; attempt++) {
+    try {
+      final items = await ApiService.getBookings();
+      debugPrint('Pull bookings attempt $attempt count: ${items.length}');
+      await _replaceCloudBookings(items);
+      return;
+    } catch (e) {
+      debugPrint('Pull bookings attempt $attempt failed: $e');
+      if (attempt < 3) {
+        await Future.delayed(const Duration(seconds: 4));
+      }
+    }
+  }
 }
 
 /// Merge cloud restore payload into local stores (after login).
 Future<void> applyCloudRestore(Map<String, dynamic> data) async {
   final bookings = data['bookings'];
   if (bookings is List) {
-    await _mergeCloudBookings(bookings);
+    await _replaceCloudBookings(bookings);
   } else {
     debugPrint('Restore bookings: missing or invalid');
   }
 
-  try {
-    final items = await ApiService.getBookings();
-    debugPrint('GET /api/bookings count: ${items.length}');
-    if (items.isNotEmpty) {
-      await _mergeCloudBookings(items);
-    }
-  } catch (e) {
-    debugPrint('GET /api/bookings failed: $e');
-  }
+  await pullBookingsFromCloud();
 
   final salesRaw = data['sales'];
   if (salesRaw is List && salesRaw.isNotEmpty) {
@@ -1073,6 +1089,7 @@ class _LoginPageState extends State<LoginPage> {
     });
 
     try {
+      await ApiService.healthCheck();
       final loginRes = await ApiService.login(
         username: username,
         password: password,
@@ -1143,7 +1160,15 @@ class _LoginPageState extends State<LoginPage> {
         context,
         appRoute(HomePage(username: uname)),
       );
-    } on ApiException {
+    } on ApiException catch (e) {
+      final serverUp = await ApiService.healthCheck();
+      if (serverUp) {
+        setState(() {
+          message = "Cloud login failed: ${e.message}";
+          _loading = false;
+        });
+        return;
+      }
       final user = UserStore.authenticate(username, password);
       if (user != null) {
         if (user.isBlocked) {
@@ -3245,8 +3270,21 @@ Widget ticketButton(
   );
 }
 
-class ReportsPage extends StatelessWidget {
+class ReportsPage extends StatefulWidget {
   const ReportsPage({super.key});
+  @override
+  State<ReportsPage> createState() => _ReportsPageState();
+}
+
+class _ReportsPageState extends State<ReportsPage> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(pullBookingsFromCloud());
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -4829,6 +4867,14 @@ class _SalesReportPageState extends State<SalesReportPage> {
   String modeFilter = "Select";
   DateTime fromDate = defaultReportFromDate();
   DateTime toDate = defaultReportToDate();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(pullBookingsFromCloud());
+    });
+  }
 
   @override
   void dispose() {

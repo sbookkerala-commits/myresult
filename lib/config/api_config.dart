@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:http/http.dart' as http;
 
 /// Production cloud backend (Render).
 class ApiConfig {
@@ -14,5 +15,10 @@ class ApiConfig {
 
   static Future<void> init() async {
     debugPrint('API base URL: $baseUrl');
+    try {
+      await http
+          .get(Uri.parse('$baseUrl/health'))
+          .timeout(const Duration(seconds: 60));
+    } catch (_) {}
   }
 }
