@@ -60,18 +60,26 @@ class SyncService {
   }
 
   /// After login — restore all data from MongoDB.
-  static Future<Map<String, dynamic>> restoreFromCloud() async {
-    isRestoring = true;
-    restoring.value = true;
+  static Future<Map<String, dynamic>> restoreFromCloud({
+    bool showProgress = true,
+  }) async {
+    if (showProgress) {
+      isRestoring = true;
+      restoring.value = true;
+    }
     try {
-      isOnline = await ApiService.healthCheck();
-      if (!isOnline) {
-        throw ApiException('No connection to server');
+      if (showProgress) {
+        isOnline = await ApiService.healthCheck();
+        if (!isOnline) {
+          throw ApiException('No connection to server');
+        }
       }
       return await ApiService.restore();
     } finally {
-      isRestoring = false;
-      restoring.value = false;
+      if (showProgress) {
+        isRestoring = false;
+        restoring.value = false;
+      }
     }
   }
 
@@ -119,6 +127,49 @@ class SyncService {
 
   static Future<void> queueUsers(List<Map<String, dynamic>> users) async {
     await OfflineQueue.enqueue(QueueOp.users, {'users': users});
+    await flushQueue();
+  }
+
+  static Future<void> queueRateSets(List<Map<String, dynamic>> sets) async {
+    await OfflineQueue.enqueue(QueueOp.settings, {
+      'key': 'rateSets',
+      'value': sets,
+    });
+    await flushQueue();
+  }
+
+  static Future<void> queuePriceList(
+    Map<String, dynamic> schemes,
+    Map<String, dynamic> gameRates,
+  ) async {
+    await OfflineQueue.enqueue(QueueOp.settings, {
+      'key': 'priceList',
+      'value': schemes,
+    });
+    await OfflineQueue.enqueue(QueueOp.settings, {
+      'key': 'priceListGameRates',
+      'value': gameRates,
+    });
+    await flushQueue();
+  }
+
+  static Future<void> queueDrawSchedules(
+    Map<String, dynamic> schedules,
+  ) async {
+    await OfflineQueue.enqueue(QueueOp.settings, {
+      'key': 'drawSchedules',
+      'value': schedules,
+    });
+    await flushQueue();
+  }
+
+  static Future<void> queueDigitCountLimits(
+    Map<String, dynamic> limits,
+  ) async {
+    await OfflineQueue.enqueue(QueueOp.settings, {
+      'key': 'digitCountLimits',
+      'value': limits,
+    });
     await flushQueue();
   }
 

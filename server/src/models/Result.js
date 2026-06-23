@@ -6,6 +6,7 @@ const resultSchema = new mongoose.Schema(
     date: { type: Date, required: true, index: true },
     prizes: { type: [String], default: [] },
     compliments: { type: [String], default: [] },
+    manualOverride: { type: Boolean, default: false },
     updatedBy: { type: String, default: null },
     deletedAt: { type: Date, default: null },
   },

@@ -32,11 +32,22 @@ router.post('/', authRequired, async (req, res) => {
         const username = (u.username || '').trim().toLowerCase();
         if (!username) continue;
         const role = (u.role || 'AGENT').toUpperCase();
+        const isAgentRole = role === 'AGENT' || role === 'SUBAGENT';
         const existing = await User.findOne({ username });
         const passwordHash = u.password
           ? await bcrypt.hash(u.password, 10)
           : existing?.passwordHash;
         if (!passwordHash) continue;
+        const agentFields = isAgentRole
+          ? {
+              scheme: (u.scheme || 'ALL').toString(),
+              rateSetId: (u.rateSetId || 'standard').toString(),
+              amountLimit: Number(u.amountLimit) || 0,
+              digit1CountLimit: parseInt(u.digit1CountLimit, 10) || 0,
+              digit2CountLimit: parseInt(u.digit2CountLimit, 10) || 0,
+              digit3CountLimit: parseInt(u.digit3CountLimit, 10) || 0,
+            }
+          : {};
         await User.findOneAndUpdate(
           { username },
           {
@@ -45,7 +56,9 @@ router.post('/', authRequired, async (req, res) => {
               passwordHash,
               role,
               isBlocked: !!u.isBlocked,
+              isSalesBlocked: !!u.isSalesBlocked,
               deletedAt: u.deleted ? new Date() : null,
+              ...agentFields,
             },
           },
           { upsert: true }
@@ -58,8 +71,13 @@ router.post('/', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'key required' });
     }
 
-    // Price list — admin only
-    if (key === 'priceList' && req.user.role !== 'ADMIN') {
+    // Price list / rate sets — admin only
+    if (
+      (key === 'priceList' ||
+        key === 'priceListGameRates' ||
+        key === 'rateSets') &&
+      req.user.role !== 'ADMIN'
+    ) {
       return res.status(403).json({ error: 'Admin only: price list edit' });
     }
 
@@ -80,7 +98,9 @@ router.post('/', authRequired, async (req, res) => {
 router.get('/users', authRequired, requireRoles('ADMIN', 'AGENT'), async (req, res) => {
   try {
     const users = await User.find({ deletedAt: null })
-      .select('username role isBlocked')
+      .select(
+        'username role isBlocked isSalesBlocked scheme rateSetId amountLimit digit1CountLimit digit2CountLimit digit3CountLimit'
+      )
       .lean();
     res.json({ users });
   } catch (e) {

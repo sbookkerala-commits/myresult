@@ -22,6 +22,7 @@ router.get('/', authRequired, async (req, res) => {
         date: r.date,
         prizes: r.prizes,
         compliments: r.compliments,
+        manualOverride: !!r.manualOverride,
       })),
     });
   } catch (e) {
@@ -33,22 +34,36 @@ router.post('/', authRequired, async (req, res) => {
   try {
     const body = req.body || {};
     const drawCode = (body.drawCode || '').trim();
-    const date = startOfDay(body.date ? new Date(body.date) : new Date());
+    const day = startOfDay(body.date ? new Date(body.date) : new Date());
     if (!drawCode) {
       return res.status(400).json({ error: 'drawCode required' });
     }
 
     const prizes = Array.isArray(body.prizes) ? body.prizes : [];
     const compliments = Array.isArray(body.compliments) ? body.compliments : [];
+    const manualOverride = body.manualOverride === true;
+
+    const existing = await Result.findOne({ drawCode, date: day, deletedAt: null }).lean();
+    if (existing?.manualOverride && !manualOverride) {
+      return res.json({
+        drawCode: existing.drawCode,
+        date: existing.date,
+        prizes: existing.prizes,
+        compliments: existing.compliments,
+        manualOverride: true,
+        skipped: true,
+      });
+    }
 
     const saved = await Result.findOneAndUpdate(
-      { drawCode, date },
+      { drawCode, date: day },
       {
         $set: {
           drawCode,
-          date,
+          date: day,
           prizes,
           compliments,
+          manualOverride,
           updatedBy: req.user.username,
           deletedAt: null,
         },
@@ -58,11 +73,11 @@ router.post('/', authRequired, async (req, res) => {
 
     // Permanent chart archive (never deleted by retention)
     await ChartArchive.findOneAndUpdate(
-      { drawCode, date },
+      { drawCode, date: day },
       {
         $set: {
           drawCode,
-          date,
+          date: day,
           drawLabel: body.drawLabel || drawCode,
           prizes,
           compliments,
@@ -78,6 +93,7 @@ router.post('/', authRequired, async (req, res) => {
       date: saved.date,
       prizes: saved.prizes,
       compliments: saved.compliments,
+      manualOverride: !!saved.manualOverride,
     });
   } catch (e) {
     console.error('POST result', e);

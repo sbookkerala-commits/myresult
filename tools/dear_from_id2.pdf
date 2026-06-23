@@ -1,0 +1,27 @@
+Content not found.... with this id<script>
+        $(document).ready(function() {
+            
+            $(".Check_File").click(function() {
+                
+                var url = 'old_results/'+$(this).data('id');
+                if (url != "") {
+                    $.ajax({
+                        url: url,
+                        type: 'HEAD',
+                        error: function()
+                        {
+                            alert("File doesn't exists");
+                            $("#output").text("File doesn't exists");
+                        },
+                        success: function()
+                        {
+                            //window.location.href =url;
+                          window.location.href = "download.php?val="+url;
+                        }
+                    });
+                } else {
+                    $("#Output").text("Please enter File URL");
+                }
+            });
+        });
+    </script>

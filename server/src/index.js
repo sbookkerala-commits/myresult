@@ -40,7 +40,7 @@ app.get('/health', (_, res) =>
     service: 'myresult-api',
     environment: process.env.NODE_ENV || 'development',
     time: new Date().toISOString(),
-    retentionDays: parseInt(process.env.RETENTION_DAYS || '21', 10),
+    retentionDays: parseInt(process.env.RETENTION_DAYS || '20', 10),
     database: process.env.USE_EMBEDDED_MONGO === 'true' ? 'embedded' : 'atlas',
   })
 );
@@ -56,9 +56,28 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/sync', restoreRoutes);
 app.use('/api/backup', backupRoutes);
 
+const publicDir = path.join(__dirname, '../public');
+const fs = require('fs');
+if (fs.existsSync(publicDir)) {
+  app.use(express.static(publicDir, { index: 'index.html', maxAge: '1h' }));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path === '/health') return next();
+    res.sendFile(path.join(publicDir, 'index.html'), (err) => {
+      if (err) next();
+    });
+  });
+  console.log(`Web app: serving static files from ${publicDir}`);
+}
+
 async function start() {
   await connectDb();
   await ensureAdminUser();
+
+  try {
+    await runRetentionJob();
+  } catch (e) {
+    console.error('startup retention error', e);
+  }
 
   cron.schedule('0 2 * * *', async () => {
     try {

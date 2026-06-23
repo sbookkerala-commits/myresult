@@ -6,6 +6,8 @@ const bookingSchema = new mongoose.Schema(
     username: { type: String, required: true, index: true },
     ownerUsername: { type: String, required: true, index: true },
     rows: { type: Array, default: [] },
+    drawName: { type: String, default: '' },
+    businessDate: { type: Date, default: null, index: true },
     createdAt: { type: Date, required: true, index: true },
     deletedAt: { type: Date, default: null },
     clientId: { type: String, default: null },

@@ -7,6 +7,7 @@ const saleSchema = new mongoose.Schema(
     count: { type: Number, required: true },
     amount: { type: Number, required: true },
     time: { type: String, default: '' },
+    businessDate: { type: Date, default: null },
     username: { type: String, required: true, index: true },
     ownerUsername: { type: String, required: true, index: true },
     createdAt: { type: Date, required: true, index: true },

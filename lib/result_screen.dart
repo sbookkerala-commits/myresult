@@ -5,7 +5,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'main.dart' show ResultStore, ResultSnapshot;
+import 'main.dart'
+    show ResultStore, ResultSnapshot, sortedComplimentsColumnMajor, formatComplimentDisplay;
+
+int _complimentCellIndex(int row, int col) => col * 10 + row;
 
 Color getResultThemeColor(String time) {
   switch (time) {
@@ -78,7 +81,8 @@ class _ResultScreenState extends State<ResultScreen> {
     for (int i = 0; i < 30 && i < snapshot.compliments.length; i++) {
       c[i] = snapshot.compliments[i];
     }
-    return (prizes: p, compliments: c);
+    final sorted = sortedComplimentsColumnMajor(c);
+    return (prizes: p, compliments: sorted);
   }
 
   @override
@@ -126,25 +130,49 @@ class _ResultScreenState extends State<ResultScreen> {
                       _buildHeader(themeColor),
                       const Divider(height: 1, indent: 15, endIndent: 15),
                       const SizedBox(height: 8),
-                      _buildPrizeRow(
-                          "1st Prize", p[0], const Color(0xFFC8E6C9)),
-                      _buildPrizeRow(
-                          "2nd Prize", p[1], const Color(0xFFBBDEFB)),
-                      _buildPrizeRow(
-                          "3rd Prize", p[2], const Color(0xFFFFF9C4)),
-                      _buildPrizeRow(
-                          "4th Prize", p[3], const Color(0xFFE1BEE7)),
-                      _buildPrizeRow(
-                          "5th Prize", p[4], const Color(0xFFFFE0B2)),
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 8),
-                        child: Text("COMPLIMENTS",
-                            style: TextStyle(
-                                color: Color(0xFF555555),
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13)),
+                      _buildPrizeRow("1", p[0], const Color(0xFFC2F4DF), 22, 0),
+                      _buildPrizeRow("2", p[1], const Color(0xFFFFECE8), 20, 1),
+                      _buildPrizeRow("3", p[2], const Color(0xFFFFDAEA), 18, 2),
+                      _buildPrizeRow("4", p[3], const Color(0xFFF9CBF5), 16, 3),
+                      _buildPrizeRow("5", p[4], const Color(0xFFD8C3EF), 14, 4),
+                      Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 15),
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: const Color(0xFF9E9E9E),
+                            width: 0.8,
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 12, horizontal: 8),
+                              decoration: const BoxDecoration(
+                                border: Border(
+                                  bottom: BorderSide(
+                                    color: Color(0xFF9E9E9E),
+                                    width: 0.8,
+                                  ),
+                                ),
+                              ),
+                              child: const Text(
+                                "COMPLIMENTS",
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: Colors.black,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
+                                  letterSpacing: 0.8,
+                                ),
+                              ),
+                            ),
+                            _buildComplimentsRows(c),
+                          ],
+                        ),
                       ),
-                      _buildComplimentsGrid(c),
                       const SizedBox(height: 10),
                     ],
                   ),
@@ -197,49 +225,84 @@ class _ResultScreenState extends State<ResultScreen> {
     );
   }
 
-  Widget _buildPrizeRow(String label, String value, Color color) {
+  Widget _buildPrizeRow(String position, String value, Color color,
+      double numberFontSize, int prizeIndex) {
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 15, vertical: 4),
+      margin: const EdgeInsets.symmetric(horizontal: 15),
       padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
-      decoration:
-          BoxDecoration(color: color, borderRadius: BorderRadius.circular(10)),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.vertical(
+          top: prizeIndex == 0 ? const Radius.circular(10) : Radius.zero,
+          bottom: prizeIndex == 4 ? const Radius.circular(10) : Radius.zero,
+        ),
+      ),
+      child: Stack(
+        alignment: Alignment.center,
         children: [
-          Text(label,
-              style:
-                  const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-          Text(value,
-              style:
-                  const TextStyle(fontWeight: FontWeight.w900, fontSize: 20)),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              position,
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 11,
+                color: Colors.black.withValues(alpha: 0.75),
+              ),
+            ),
+          ),
+          Text(
+            value,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                fontWeight: FontWeight.w900, fontSize: numberFontSize),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildComplimentsGrid(List<String> c) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 10),
-      child: GridView.builder(
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
-          childAspectRatio: 3.8,
-          mainAxisSpacing: 3,
-          crossAxisSpacing: 6,
-        ),
-        itemCount: c.length,
-        itemBuilder: (context, i) => Container(
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-              color: const Color(0xFFF5F5F5),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: Colors.grey.shade300)),
-          child: Text(c[i],
-              style:
-                  const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-        ),
+  Widget _buildComplimentsRows(List<String> c) {
+    return SizedBox(
+      height: 320,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: List.generate(3, (col) {
+          return Expanded(
+            child: Container(
+              decoration: col < 2
+                  ? const BoxDecoration(
+                      border: Border(
+                        right: BorderSide(
+                          color: Color(0xFF9E9E9E),
+                          width: 0.8,
+                        ),
+                      ),
+                    )
+                  : null,
+              child: Column(
+                children: List.generate(10, (row) {
+                  final index = _complimentCellIndex(row, col);
+                  final value = index < c.length ? c[index] : "---";
+                  final display = formatComplimentDisplay(value);
+                  return Expanded(
+                    child: Center(
+                      child: Text(
+                        display,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                          color: Color(0xFF1A1A1A),
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            ),
+          );
+        }),
       ),
     );
   }

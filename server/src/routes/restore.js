@@ -51,6 +51,8 @@ router.get('/restore', authRequired, async (req, res) => {
         billNo: b.billNo,
         username: b.username,
         rows: b.rows,
+        drawName: b.drawName || '',
+        businessDate: b.businessDate || null,
         createdAt: b.createdAt,
       })),
       sales: sales.map((s) => ({
@@ -59,6 +61,7 @@ router.get('/restore', authRequired, async (req, res) => {
         count: s.count,
         amount: s.amount,
         time: s.time,
+        businessDate: s.businessDate || null,
         username: s.username,
         createdAt: s.createdAt,
       })),
@@ -67,6 +70,7 @@ router.get('/restore', authRequired, async (req, res) => {
         date: r.date,
         prizes: r.prizes,
         compliments: r.compliments,
+        manualOverride: !!r.manualOverride,
       })),
       pending: pending.map((p) => ({
         id: p._id,

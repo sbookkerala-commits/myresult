@@ -28,6 +28,7 @@ router.get('/', authRequired, async (req, res) => {
         count: s.count,
         amount: s.amount,
         time: s.time,
+        businessDate: s.businessDate || null,
         username: s.username,
         createdAt: s.createdAt,
         clientId: s.clientId,
@@ -46,12 +47,17 @@ router.post('/', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'type and number required' });
     }
 
+    const businessDate = body.businessDate
+      ? new Date(body.businessDate)
+      : null;
+
     const sale = await Sale.create({
       type: body.type,
       number: body.number,
       count: body.count || 0,
       amount: body.amount || 0,
       time: body.time || '',
+      businessDate,
       username: body.username || req.user.username,
       ownerUsername: req.user.username,
       createdAt,
@@ -65,6 +71,7 @@ router.post('/', authRequired, async (req, res) => {
       count: sale.count,
       amount: sale.amount,
       time: sale.time,
+      businessDate: sale.businessDate || null,
       username: sale.username,
       createdAt: sale.createdAt,
       clientId: sale.clientId,

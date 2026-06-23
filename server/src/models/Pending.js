@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-/** Pending / draft bookings — 21-day rolling retention */
+/** Pending / draft bookings — 20-day rolling retention */
 const pendingSchema = new mongoose.Schema(
   {
     ownerUsername: { type: String, required: true, index: true },

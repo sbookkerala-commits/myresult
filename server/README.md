@@ -30,7 +30,7 @@ npm run dev
 
 ## Data rules
 
-- **21-day retention:** bookings, sales, results, pending
+- **20-day retention:** bookings, sales, results, pending
 - **Chart archive:** permanent, never auto-deleted
 - **Daily backup:** 2:00 AM cron → `server/backups/`
 - **Passwords:** bcrypt hashed
@@ -38,6 +38,23 @@ npm run dev
 
 ## Flutter
 
-- Local cache: **SQLite** (`lib/database/local_database.dart`)
+- Local cache: **SQLite** (mobile) / **SharedPreferences** (web)
 - API config: `lib/config/api_config.dart`
 - No Firebase dependencies
+
+## Web app (PWA)
+
+Build from project root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_web.ps1
+```
+
+This creates `server/public/` (Flutter web release). The API serves it at `/` when that folder exists.
+
+**Local test:** `cd server && npm start` → open `http://localhost:3000`
+
+**Render deploy:** commit `server/public/` after running the build script, then push.  
+Live URL: `https://myresult-zu6v.onrender.com/` (same host as API)
+
+**Chrome dev:** `flutter run -d chrome` — uses cloud API automatically on localhost.

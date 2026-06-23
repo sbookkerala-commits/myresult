@@ -32,6 +32,8 @@ router.get('/', authRequired, async (req, res) => {
         billNo: b.billNo,
         username: b.username,
         rows: b.rows,
+        drawName: b.drawName || '',
+        businessDate: b.businessDate || null,
         createdAt: b.createdAt,
         clientId: b.clientId,
       })),
@@ -51,11 +53,17 @@ router.post('/', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'billNo and rows required' });
     }
 
+    const businessDate = body.businessDate
+      ? new Date(body.businessDate)
+      : null;
+
     const doc = {
       billNo,
       username: body.username || req.user.username,
       ownerUsername: req.user.username,
       rows: body.rows,
+      drawName: body.drawName || '',
+      businessDate,
       createdAt,
       clientId: body.clientId || null,
       deletedAt: body.deleted ? new Date() : null,
@@ -75,6 +83,8 @@ router.post('/', authRequired, async (req, res) => {
       billNo: saved.billNo,
       username: saved.username,
       rows: saved.rows,
+      drawName: saved.drawName || '',
+      businessDate: saved.businessDate || null,
       createdAt: saved.createdAt,
       clientId: saved.clientId,
     });

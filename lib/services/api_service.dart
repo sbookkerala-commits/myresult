@@ -24,7 +24,7 @@ class ApiService {
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'username': username, 'password': password}),
         )
-        .timeout(ApiConfig.timeout);
+        .timeout(ApiConfig.loginTimeout);
 
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     if (res.statusCode != 200) {
@@ -101,6 +101,22 @@ class ApiService {
     await _post('/api/results', payload);
   }
 
+  static Future<List<Map<String, dynamic>>> getResults() async {
+    final res = await http
+        .get(
+          Uri.parse('${ApiConfig.baseUrl}/api/results'),
+          headers: _headers,
+        )
+        .timeout(ApiConfig.timeout);
+    if (res.statusCode != 200) {
+      throw ApiException('Fetch results failed (${res.statusCode})');
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final items = data['items'];
+    if (items is! List) return [];
+    return items.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
   static Future<void> postSettings({
     required String key,
     required dynamic value,
@@ -110,6 +126,22 @@ class ApiService {
 
   static Future<void> syncUsers(List<Map<String, dynamic>> users) async {
     await _post('/api/settings', {'users': users});
+  }
+
+  static Future<List<Map<String, dynamic>>> getUsers() async {
+    final res = await http
+        .get(
+          Uri.parse('${ApiConfig.baseUrl}/api/users'),
+          headers: _headers,
+        )
+        .timeout(ApiConfig.timeout);
+    if (res.statusCode != 200) {
+      throw ApiException('Fetch users failed (${res.statusCode})');
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final items = data['users'];
+    if (items is! List) return [];
+    return items.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
   static Future<List<Map<String, dynamic>>> getChartArchive() async {
@@ -130,7 +162,7 @@ class ApiService {
     try {
       final res = await http
           .get(Uri.parse('${ApiConfig.baseUrl}/health'))
-          .timeout(const Duration(seconds: 15));
+          .timeout(const Duration(seconds: 5));
       return res.statusCode == 200;
     } catch (_) {
       return false;
