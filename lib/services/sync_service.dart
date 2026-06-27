@@ -125,6 +125,18 @@ class SyncService {
     await flushQueue();
   }
 
+  static Future<void> queueResultDelete(
+    String drawCode,
+    DateTime date,
+  ) async {
+    final day = DateTime(date.year, date.month, date.day);
+    await OfflineQueue.enqueue(QueueOp.resultDelete, {
+      'drawCode': drawCode.trim().toUpperCase(),
+      'date': day.toIso8601String(),
+    });
+    await flushQueue();
+  }
+
   static Future<void> queueUsers(List<Map<String, dynamic>> users) async {
     await OfflineQueue.enqueue(QueueOp.users, {'users': users});
     await flushQueue();
@@ -202,6 +214,12 @@ class SyncService {
             break;
           case 'result':
             await ApiService.postResult(payload);
+            break;
+          case 'resultDelete':
+            await ApiService.deleteResult(
+              payload['drawCode'] as String,
+              DateTime.parse(payload['date'] as String),
+            );
             break;
           case 'settings':
             await ApiService.postSettings(

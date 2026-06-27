@@ -26,10 +26,9 @@ dependencies:
   shared_preferences: ^2.2.3
   connectivity_plus: ^6.0.3
   webview_flutter: ^4.8.0
-  image_picker: ^1.0.7
-  font_awesome_flutter: ^10.8.0
   syncfusion_flutter_pdf: ^33.2.13
   url_launcher: ^6.3.1
+  font_awesome_flutter: ^11.0.0
 
 dev_dependencies:
   flutter_test:

@@ -262,7 +262,7 @@ class DearFastResultSource {
 
     final soldIdx = lines.indexWhere((l) => l.toLowerCase().contains('sold by'));
     if (soldIdx < 0) {
-      return _partialFirstPrize(drawCode, day, firstPrize);
+      return _parseDearPdfWithoutSoldBy(drawCode, day, lines, firstPrize);
     }
 
     final fifthRaw = <String>[];
@@ -319,6 +319,86 @@ class DearFastResultSource {
         : <String>[];
     final fourthNums = _numbersFromLines(fourthLines, 4);
 
+    return _buildDearPdfResult(
+      drawCode: drawCode,
+      day: day,
+      firstPrize: firstPrize,
+      secondNums: secondNums,
+      thirdNums: thirdNums,
+      fourthNums: fourthNums,
+      fifthRaw: fifthRaw,
+    );
+  }
+
+  /// dearlottery.in uploads — consolation grid first, prizes before series line.
+  static FetchedResultData? _parseDearPdfWithoutSoldBy(
+    String drawCode,
+    DateTime day,
+    List<String> lines,
+    String firstPrize,
+  ) {
+    final firstLineIdx = lines.indexWhere(
+      (l) => RegExp(r'(\d{1,2}[A-Z])\s+(\d{5})').hasMatch(l),
+    );
+    if (firstLineIdx < 0) {
+      return _partialFirstPrize(drawCode, day, firstPrize);
+    }
+
+    final fifthRaw = <String>[];
+    final fiveDigitLines = <String>[];
+    final fourDigitLines = <String>[];
+
+    for (var i = 0; i < firstLineIdx; i++) {
+      final line = lines[i];
+      if (RegExp(r'^\d{4}$').hasMatch(line)) {
+        fifthRaw.add(line);
+        continue;
+      }
+      if (RegExp(r'^\d{2}/\d{2}/\d{2}$').hasMatch(line)) continue;
+
+      final nums = RegExp(r'\d{4,5}')
+          .allMatches(line)
+          .map((m) => m.group(0)!)
+          .toList();
+      if (nums.isEmpty) continue;
+
+      if (nums.every((n) => n.length == 5)) {
+        fiveDigitLines.add(line);
+      } else if (nums.every((n) => n.length == 4)) {
+        fourDigitLines.add(line);
+      }
+    }
+
+    final secondNums = _numbersFromLines(fiveDigitLines, 5);
+    final thirdNums = _numbersFromLines(
+      fourDigitLines.length >= 2 ? fourDigitLines.sublist(0, 2) : fourDigitLines,
+      4,
+    );
+    final fourthLines = fourDigitLines.length > 2
+        ? fourDigitLines.sublist(2)
+        : <String>[];
+    final fourthNums = _numbersFromLines(fourthLines, 4);
+
+    return _buildDearPdfResult(
+      drawCode: drawCode,
+      day: day,
+      firstPrize: firstPrize,
+      secondNums: secondNums,
+      thirdNums: thirdNums,
+      fourthNums: fourthNums,
+      fifthRaw: fifthRaw,
+    );
+  }
+
+  static FetchedResultData _buildDearPdfResult({
+    required String drawCode,
+    required DateTime day,
+    required String firstPrize,
+    required List<String> secondNums,
+    required List<String> thirdNums,
+    required List<String> fourthNums,
+    required List<String> fifthRaw,
+  }) {
     final prizes = _emptyPrizes();
     prizes[0] = firstPrize;
     if (secondNums.isNotEmpty) prizes[1] = _last3(secondNums.first);
@@ -336,6 +416,50 @@ class DearFastResultSource {
       prizes: prizes,
       compliments: compliments,
     );
+  }
+
+  static String? _dearDotInTimeSlot(String drawCode) {
+    switch (drawCode.trim().toUpperCase()) {
+      case 'DEAR1':
+        return '1pm';
+      case 'DEAR6':
+        return '6pm';
+      case 'DEAR8':
+        return '8pm';
+      default:
+        return null;
+    }
+  }
+
+  static String _dearDotInDateDmy(DateTime day) {
+    final d = DateTime(day.year, day.month, day.day);
+    return '${d.day.toString().padLeft(2, '0')}-'
+        '${d.month.toString().padLeft(2, '0')}-'
+        '${d.year}';
+  }
+
+  /// Daily PDF from dearlottery.in (often live before Nagaland/API).
+  static Future<FetchedResultData?> fetchDearLotteryDotInPdf(
+    String drawCode,
+    DateTime date,
+  ) async {
+    final code = drawCode.trim().toUpperCase();
+    final slot = _dearDotInTimeSlot(code);
+    if (slot == null) return null;
+    final day = DateTime(date.year, date.month, date.day);
+    final uri = Uri.parse(
+      'https://dearlottery.in/uploads/${day.year}/$slot-${_dearDotInDateDmy(day)}.pdf',
+    );
+    try {
+      final res = await http.get(uri).timeout(const Duration(seconds: 25));
+      if (res.statusCode != 200 || res.bodyBytes.length < 4096) return null;
+      final text = _extractPdfText(res.bodyBytes);
+      if (text.trim().isEmpty) return null;
+      return _parseDearPdfText(code, day, text);
+    } catch (e) {
+      debugPrint('DearFastResultSource.fetchDearLotteryDotInPdf $code: $e');
+      return null;
+    }
   }
 
   static List<String> _numbersFromLines(List<String> lines, int width) {

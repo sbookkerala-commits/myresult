@@ -232,10 +232,6 @@ class _ResultScreenState extends State<ResultScreen> {
       padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
       decoration: BoxDecoration(
         color: color,
-        borderRadius: BorderRadius.vertical(
-          top: prizeIndex == 0 ? const Radius.circular(10) : Radius.zero,
-          bottom: prizeIndex == 4 ? const Radius.circular(10) : Radius.zero,
-        ),
       ),
       child: Stack(
         alignment: Alignment.center,

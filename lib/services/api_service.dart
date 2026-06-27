@@ -101,6 +101,22 @@ class ApiService {
     await _post('/api/results', payload);
   }
 
+  static Future<void> deleteResult(String drawCode, DateTime date) async {
+    final code = drawCode.trim().toUpperCase();
+    final day = DateTime(date.year, date.month, date.day);
+    final dateStr =
+        '${day.year}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}';
+    final res = await http
+        .delete(
+          Uri.parse('${ApiConfig.baseUrl}/api/results/$code/$dateStr'),
+          headers: _headers,
+        )
+        .timeout(ApiConfig.timeout);
+    if (res.statusCode >= 400) {
+      throw ApiException('Delete result failed (${res.statusCode})');
+    }
+  }
+
   static Future<List<Map<String, dynamic>>> getResults() async {
     final res = await http
         .get(

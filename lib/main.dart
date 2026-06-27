@@ -6,10 +6,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'app_locale.dart';
+import 'app_messages.dart';
 import 'draw_schedule_store.dart';
 import 'data_retention.dart';
 import 'digit_limit_store.dart';
 import 'agent_config.dart';
+import 'booking_contact_store.dart';
 import 'price_list_store.dart';
 import 'config/api_config.dart';
 import 'services/api_service.dart';
@@ -186,6 +189,7 @@ Future<void> main() async {
     await AppDatabase.ensureReady();
   }
   await Future.wait([
+    AppLocale.init(),
     UserStore.init(),
     RateSetStore.init(),
     PriceListStore.init(),
@@ -194,9 +198,12 @@ Future<void> main() async {
     BillsStore.init(),
     SalesStore.init(),
     ResultStore.init(),
+    BookingContactStore.init(),
   ]);
 
   _scheduleDailyRetentionPurge();
+  _startDearAutoResultScheduler();
+  _startKeralaAutoResultScheduler();
 
   AppDrawTheme.setDraw(DrawScheduleStore.currentUiDraw());
   runApp(const MyApp());
@@ -214,6 +221,42 @@ Future<void> _initNetworkServices() async {
 }
 
 Timer? _retentionPurgeTimer;
+Timer? _dearAutoFetchTimer;
+Timer? _keralaAutoFetchTimer;
+
+Future<void> _runDearAutoFetchTick() async {
+  try {
+    await ResultStore.refreshDearDrawsIfNeeded();
+  } catch (e) {
+    debugPrint('Dear auto fetch tick error: $e');
+  }
+}
+
+Future<void> _runKeralaAutoFetchTick() async {
+  try {
+    await ResultStore.refreshKeralaIfNeeded();
+  } catch (e) {
+    debugPrint('Kerala auto fetch tick error: $e');
+  }
+}
+
+void _startDearAutoResultScheduler() {
+  _dearAutoFetchTimer?.cancel();
+  unawaited(_runDearAutoFetchTick());
+  _dearAutoFetchTimer = Timer.periodic(
+    ResultFetchService.kTodayPollInterval,
+    (_) => unawaited(_runDearAutoFetchTick()),
+  );
+}
+
+void _startKeralaAutoResultScheduler() {
+  _keralaAutoFetchTimer?.cancel();
+  unawaited(_runKeralaAutoFetchTick());
+  _keralaAutoFetchTimer = Timer.periodic(
+    ResultFetchService.kTodayPollInterval,
+    (_) => unawaited(_runKeralaAutoFetchTick()),
+  );
+}
 
 Future<void> _runLocalRetentionPurge() async {
   final removed = await Future.wait([
@@ -928,6 +971,8 @@ class BillRecord {
     this.customerName = '',
   });
 
+  String get billNote => customerName.trim();
+
   DateTime get reportCalendarDate => _calendarDate(businessDate);
 
   static void _normalizeRowMap(Map<String, dynamic> row) {
@@ -996,7 +1041,7 @@ class BillRecord {
             : int.tryParse(billRaw?.toString() ?? "");
     final parsedCreated = _parseDateTime(json["createdAt"]);
     final username = json["username"]?.toString() ?? "";
-    final customerName = json["customerName"]?.toString() ?? "";
+    final customerName = _readBillNoteFromJson(json);
     if (billNo == null || parsedCreated == null) return null;
     final created = parsedCreated.toLocal();
     final drawNameRaw = json["drawName"]?.toString() ?? '';
@@ -1053,6 +1098,19 @@ class BillRecord {
       if (nested != null) return DateTime.tryParse(nested.toString());
     }
     return DateTime.tryParse(raw.toString());
+  }
+
+  static String _readBillNoteFromJson(Map<String, dynamic> json) {
+    for (final key in const [
+      'customerName',
+      'customer_name',
+      'billNote',
+      'bill_note',
+    ]) {
+      final value = json[key]?.toString().trim() ?? '';
+      if (value.isNotEmpty) return value;
+    }
+    return '';
   }
 
   int get totalCount => rows.fold<int>(
@@ -1394,6 +1452,26 @@ bool _keralaComplimentSetsDiffer(List<String> a, List<String> b) {
   return sa.length != sb.length || !sa.containsAll(sb);
 }
 
+int _keralaValidComplimentCount(Iterable<String> raw) =>
+    raw.where(KeralaComplimentRules.isValidComplimentCell).length;
+
+List<String> _mergeKeralaComplimentProgress(
+  List<String> stored,
+  List<String> incoming,
+) {
+  final out = complimentsAscendingOrder(stored);
+  final inc = complimentsAscendingOrder(incoming);
+  final merged = List<String>.filled(KeralaComplimentRules.complimentCount, '---');
+  for (var i = 0; i < KeralaComplimentRules.complimentCount; i++) {
+    final ex = i < out.length ? out[i] : '---';
+    final ic = i < inc.length ? inc[i] : '---';
+    merged[i] = KeralaComplimentRules.isValidComplimentCell(ex)
+        ? ex
+        : (KeralaComplimentRules.isValidComplimentCell(ic) ? ic : '---');
+  }
+  return complimentsAscendingOrder(merged);
+}
+
 String _fiveDigitFirstPrize(String raw) =>
     raw.replaceAll(RegExp(r'[^0-9]'), '');
 
@@ -1456,13 +1534,16 @@ ResultSnapshot _mergeKeralaFetched(
   final incomingValid = _keralaComplimentsValid(incomingNorm);
 
   var compliments = storedNorm;
-  if (manual) {
+  if (manual && storedValid) {
     compliments = storedNorm;
   } else if (forceOverwrite && incomingValid) {
     compliments = incomingNorm;
   } else if (incomingValid &&
       (!storedValid || _keralaComplimentSetsDiffer(storedNorm, incomingNorm))) {
     compliments = incomingNorm;
+  } else if (_keralaValidComplimentCount(incomingNorm) >
+      _keralaValidComplimentCount(storedNorm)) {
+    compliments = _mergeKeralaComplimentProgress(storedNorm, incomingNorm);
   }
 
   return _sanitizeResultSnapshot(
@@ -1481,25 +1562,10 @@ Future<bool> _refreshKeralaFromNet(
   bool forceOverwrite = false,
   bool userTriggered = false,
 }) async {
+  if (ResultStore.isUserDeleted('LSK3', day)) return false;
   var changed = false;
-  await KeralaAutoResultService.instance.tick(
-    day,
-    userTriggered: userTriggered || forceOverwrite,
-    onSave: (fetched) async {
-      final existing = ResultStore.get('LSK3', day);
-      final merged = _mergeKeralaFetched(
-        existing,
-        fetched,
-        forceOverwrite: forceOverwrite,
-      );
-      if (ResultStore.signature(merged) != ResultStore.signature(existing)) {
-        ResultStore.save(merged);
-        changed = true;
-      }
-    },
-  );
-  final fetched = await ResultFetchService.fetchDraw('LSK3', day);
-  if (fetched != null) {
+
+  Future<void> mergeAndSave(FetchedResultData fetched) async {
     final existing = ResultStore.get('LSK3', day);
     final merged = _mergeKeralaFetched(
       existing,
@@ -1511,12 +1577,25 @@ Future<bool> _refreshKeralaFromNet(
       changed = true;
     }
   }
+
+  final apiFetched = await ResultFetchService.fetchDraw('LSK3', day);
+  if (apiFetched != null) {
+    await mergeAndSave(apiFetched);
+  }
+
+  await KeralaAutoResultService.instance.tick(
+    day,
+    userTriggered: userTriggered || forceOverwrite,
+    onSave: mergeAndSave,
+  );
+
   return changed;
 }
 
 Future<bool> _refreshDearFromNet(String drawCode, DateTime day) async {
   final code = drawCode.trim().toUpperCase();
   if (!DearAutoResultService.isDearDraw(code)) return false;
+  if (ResultStore.isUserDeleted(code, day)) return false;
 
   final existing = ResultStore.get(code, day);
   final merged = await DearAutoResultService.instance.fetchAndMerge(
@@ -1581,6 +1660,7 @@ ResultSnapshot _applyDearHybridMerge(
 
 class ResultStore {
   static const String _prefsKey = "app_results_v1";
+  static const String _deletedPrefsKey = "app_results_deleted_v1";
 
   static const Set<String> _validDrawCodes = {
     'DEAR1',
@@ -1599,10 +1679,67 @@ class ResultStore {
       ValueNotifier<Map<String, ResultSnapshot>>({});
 
   static Timer? _saveDebounce;
+  static Set<String> _userDeletedKeys = {};
 
   static String _key(String drawCode, DateTime date) {
     final d = DateTime(date.year, date.month, date.day);
     return "$drawCode-${d.year}-${d.month}-${d.day}";
+  }
+
+  static bool isUserDeleted(String drawCode, DateTime date) =>
+      _userDeletedKeys.contains(_key(drawCode, date));
+
+  static void _markUserDeleted(String drawCode, DateTime date) {
+    _userDeletedKeys.add(_key(drawCode, date));
+  }
+
+  static void _clearUserDeleted(String drawCode, DateTime date) {
+    _userDeletedKeys.remove(_key(drawCode, date));
+  }
+
+  static Future<void> _loadDeletedKeys() async {
+    final String? raw = kIsWeb
+        ? await LegacyPrefs.getString(_deletedPrefsKey)
+        : await LocalDatabase.getString(_deletedPrefsKey);
+    if (raw == null || raw.trim().isEmpty) return;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        _userDeletedKeys = decoded.map((e) => e.toString()).toSet();
+      }
+    } catch (e) {
+      debugPrint('ResultStore deleted keys load error: $e');
+    }
+  }
+
+  static Future<void> _saveDeletedKeys() async {
+    final json = jsonEncode(_userDeletedKeys.toList());
+    if (kIsWeb) {
+      await LegacyPrefs.setString(_deletedPrefsKey, json);
+    } else {
+      await LocalDatabase.setString(_deletedPrefsKey, json);
+    }
+  }
+
+  static void _purgeExpiredDeletedKeys(DateTime cutoff) {
+    final next = <String>{};
+    for (final key in _userDeletedKeys) {
+      final parts = key.split('-');
+      if (parts.length < 4) {
+        next.add(key);
+        continue;
+      }
+      final y = int.tryParse(parts[parts.length - 3]);
+      final m = int.tryParse(parts[parts.length - 2]);
+      final d = int.tryParse(parts[parts.length - 1]);
+      if (y == null || m == null || d == null) {
+        next.add(key);
+        continue;
+      }
+      final day = DateTime(y, m, d);
+      if (!day.isBefore(cutoff)) next.add(key);
+    }
+    _userDeletedKeys = next;
   }
 
   static Future<void> init() async {
@@ -1625,6 +1762,7 @@ class ResultStore {
         debugPrint("Local results load error: $e");
       }
     }
+    await _loadDeletedKeys();
     await purgeExpired();
   }
 
@@ -1644,11 +1782,13 @@ class ResultStore {
       }
       next[entry.key] = entry.value;
     }
+    _purgeExpiredDeletedKeys(cutoff);
     if (removed > 0) {
       results.value = next;
       await saveNow();
       debugPrint('ResultStore retention: removed $removed results');
     }
+    await _saveDeletedKeys();
     return removed;
   }
 
@@ -1675,6 +1815,9 @@ class ResultStore {
     final code = snapshot.drawCode.trim().toUpperCase();
     if (!isValidDrawCode(code)) {
       debugPrint('ResultStore.save rejected drawCode: ${snapshot.drawCode}');
+      return;
+    }
+    if (isUserDeleted(code, snapshot.date) && !snapshot.manualOverride) {
       return;
     }
     final key = _key(code, snapshot.date);
@@ -1713,6 +1856,8 @@ class ResultStore {
 
   static void saveManual(ResultSnapshot snapshot) {
     final code = snapshot.drawCode.trim().toUpperCase();
+    _clearUserDeleted(code, snapshot.date);
+    unawaited(_saveDeletedKeys());
     final now = DateTime.now();
     var s = snapshot.copyWith(manualOverride: true, updatedAt: now);
     if (DearAutoResultService.isDearDraw(code)) {
@@ -1735,11 +1880,16 @@ class ResultStore {
   static void remove(String drawCode, DateTime date) {
     final code = drawCode.trim().toUpperCase();
     final key = _key(code, date);
-    if (!results.value.containsKey(key)) return;
-    final map = {...results.value};
-    map.remove(key);
-    results.value = map;
-    _scheduleSave();
+    if (!results.value.containsKey(key) && !isUserDeleted(code, date)) return;
+    _markUserDeleted(code, date);
+    if (results.value.containsKey(key)) {
+      final map = {...results.value};
+      map.remove(key);
+      results.value = map;
+    }
+    unawaited(saveNow());
+    unawaited(_saveDeletedKeys());
+    unawaited(SyncService.queueResultDelete(code, date));
   }
 
   /// Auto-fetch / cloud pull must not replace manual 2nd–5th prizes or compliments (Kerala).
@@ -1788,6 +1938,10 @@ class ResultStore {
       if (DearAutoResultService.isDearDraw(existing!.drawCode)) {
         return true;
       }
+      if (existing.drawCode.trim().toUpperCase() == 'LSK3' &&
+          !_keralaComplimentsValid(existing.compliments)) {
+        return true;
+      }
       return false;
     }
     return true;
@@ -1834,9 +1988,10 @@ class ResultStore {
     DateTime date,
   ) async {
     if (ApiService.token == null) return null;
+    final day = DateTime(date.year, date.month, date.day);
+    if (isUserDeleted(drawCode, day)) return null;
     try {
       final items = await ApiService.getResults();
-      final day = DateTime(date.year, date.month, date.day);
       for (final item in items) {
         final s = ResultSnapshot.fromJson(item);
         if (s == null) continue;
@@ -1946,6 +2101,7 @@ class ResultStore {
     bool fromCloud = true,
   }) async {
     final day = DateTime(date.year, date.month, date.day);
+    if (isUserDeleted(drawCode, day)) return false;
     var changed = false;
     if (fromCloud && ApiService.token != null) {
       final before = signature(get(drawCode, day));
@@ -2009,6 +2165,51 @@ class ResultStore {
     return changed;
   }
 
+  /// Background Dear hybrid auto-fetch for today's draws (IST schedule).
+  static Future<int> refreshDearDrawsIfNeeded({DateTime? at}) async {
+    final ist = DearAutoResultService.nowInIndia(at: at);
+    final day = DateTime(ist.year, ist.month, ist.day);
+    var updated = 0;
+    for (final code in DearAutoResultService.dearDrawCodes) {
+      if (!DearAutoResultService.isAtOrAfterAutoCheck(code, at: ist)) continue;
+      if (isUserDeleted(code, day)) continue;
+      final snap = get(code, day);
+      if (snap != null) {
+        if (!snap.manualOverride && isComplete(snap)) continue;
+        if (snap.manualOverride &&
+            DearAutoResultService.autoSectionsComplete(
+              snap.prizes,
+              snap.compliments,
+            )) {
+          continue;
+        }
+      }
+      if (await _refreshDearFromNet(code, day)) updated++;
+    }
+    return updated;
+  }
+
+  static Future<bool> refreshDearDraw(String drawCode, DateTime date) {
+    final day = DateTime(date.year, date.month, date.day);
+    return _refreshDearFromNet(drawCode.trim().toUpperCase(), day);
+  }
+
+  /// Background Kerala auto-fetch for today (prizes + compliments).
+  static Future<int> refreshKeralaIfNeeded({DateTime? at}) async {
+    final ist = DearAutoResultService.nowInIndia(at: at);
+    final day = DateTime(ist.year, ist.month, ist.day);
+    if (isUserDeleted('LSK3', day)) return 0;
+    if (!ResultFetchService.isAtOrAfterLiveStart('LSK3', ist)) return 0;
+    final snap = get('LSK3', day);
+    if (snap != null && _keralaResultAlreadySaved(snap)) return 0;
+    debugPrint('KERALA_AUTO_START date=$day');
+    final changed = await _refreshKeralaFromNet(day);
+    if (changed) {
+      debugPrint('KERALA_AUTO_UPDATE date=$day');
+    }
+    return changed ? 1 : 0;
+  }
+
   static Future<int> loadAllForDate(DateTime date, {bool fromWeb = true}) async {
     final day = DateTime(date.year, date.month, date.day);
     var updated = 0;
@@ -2020,6 +2221,7 @@ class ResultStore {
           if (s == null) continue;
           final sd = DateTime(s.date.year, s.date.month, s.date.day);
           if (sd != day) continue;
+          if (isUserDeleted(s.drawCode, day)) continue;
           if (!ResultFetchService.kTodayDrawCodes.contains(s.drawCode)) {
             continue;
           }
@@ -2044,9 +2246,11 @@ class ResultStore {
       }
     }
     if (fromWeb) {
-      final isToday = day.year == DateTime.now().year &&
-          day.month == DateTime.now().month &&
-          day.day == DateTime.now().day;
+      final istToday = DearAutoResultService.nowInIndia();
+      final istDay = DateTime(istToday.year, istToday.month, istToday.day);
+      final isToday = day.year == istDay.year &&
+          day.month == istDay.month &&
+          day.day == istDay.day;
       if (isToday) {
         updated += await refreshTodayFromWeb(at: day);
       } else {
@@ -2062,6 +2266,11 @@ class ResultStore {
 }
 
 /// Replace local bookings with cloud data (source of truth), preserving businessDate when cloud omits it.
+String _mergeBillNote(BillRecord cloud, BillRecord local) {
+  if (cloud.billNote.isNotEmpty) return cloud.billNote;
+  return local.billNote;
+}
+
 Future<void> _replaceCloudBookings(List<dynamic> bookingsRaw) async {
   debugPrint('Replace bookings from cloud count: ${bookingsRaw.length}');
 
@@ -2095,7 +2304,7 @@ Future<void> _replaceCloudBookings(List<dynamic> bookingsRaw) async {
           drawName: local.drawName,
           rows: b.rows,
           username: b.username,
-          customerName: b.customerName,
+          customerName: _mergeBillNote(b, local),
         );
       } else if (!hasDrawNameInPayload && local.drawName.trim().isNotEmpty) {
         b = BillRecord(
@@ -2105,7 +2314,17 @@ Future<void> _replaceCloudBookings(List<dynamic> bookingsRaw) async {
           drawName: local.drawName,
           rows: b.rows,
           username: b.username,
-          customerName: b.customerName,
+          customerName: _mergeBillNote(b, local),
+        );
+      } else if (b.billNote.isEmpty && local.billNote.isNotEmpty) {
+        b = BillRecord(
+          billNo: b.billNo,
+          createdAt: b.createdAt,
+          businessDate: b.businessDate,
+          drawName: b.drawName,
+          rows: b.rows,
+          username: b.username,
+          customerName: local.billNote,
         );
       }
     }
@@ -2674,7 +2893,7 @@ void _attachWinningRowColors(
   final kind = row['winningColorKind']?.toString();
   if (kind == 'box' || kind == 'firstTier') {
     return (
-      bg: _kResultPrizeColors[0],
+      bg: _kWinningPrizeLiteColors[0],
       labelColor: Colors.black87,
       valueColor: Colors.black87,
       borderColor: Colors.black26,
@@ -2690,9 +2909,9 @@ void _attachWinningRowColors(
   }
   if (kind == 'super') {
     final idx = row['winningPrizeIndex'] as int? ?? 0;
-    if (idx >= 0 && idx < _kResultPrizeColors.length) {
+    if (idx >= 0 && idx < _kWinningPrizeLiteColors.length) {
       return (
-        bg: _kResultPrizeColors[idx],
+        bg: _kWinningPrizeLiteColors[idx],
         labelColor: Colors.black87,
         valueColor: Colors.black87,
         borderColor: Colors.black26,
@@ -2804,6 +3023,7 @@ List<Map<String, dynamic>> _allWinningRowsFromBills(
       final enriched = Map<String, dynamic>.from(row);
       enriched['winningBillNo'] = bill.billNo;
       enriched['winningBillUser'] = bill.username;
+      enriched['winningBillNote'] = bill.billNote;
       all.add(enriched);
     }
   }
@@ -2826,56 +3046,76 @@ List<Map<String, dynamic>> _allWinningRowsFromBills(
   return (win: win, superAmt: superAmt, total: win + superAmt);
 }
 
-/// Smooth lift-and-fade page transition with subtle depth when stacked.
+/// Fast smooth zoom transition for page navigation.
 Route<T> appRoute<T>(Widget page) {
   return PageRouteBuilder<T>(
     pageBuilder: (context, animation, secondaryAnimation) => page,
-    transitionDuration: const Duration(milliseconds: 340),
-    reverseTransitionDuration: const Duration(milliseconds: 290),
+    transitionDuration: const Duration(milliseconds: 220),
+    reverseTransitionDuration: const Duration(milliseconds: 190),
     transitionsBuilder: (context, animation, secondaryAnimation, child) {
       final enter = CurvedAnimation(
         parent: animation,
         curve: Curves.easeOutCubic,
         reverseCurve: Curves.easeInCubic,
       );
+      final scale = Tween<double>(begin: 0.86, end: 1.0).animate(enter);
+      final fade = Tween<double>(begin: 0.0, end: 1.0).animate(enter);
 
-      return AnimatedBuilder(
-        animation: Listenable.merge([animation, secondaryAnimation]),
-        builder: (context, _) {
-          final t = enter.value;
-          final depth = secondaryAnimation.value * animation.value;
-          final scale =
-              (0.975 + 0.025 * t) * (1.0 - 0.045 * depth);
-          final dy = 28.0 * (1.0 - t);
-          final dx = 12.0 * (1.0 - t);
-          final opacity = t.clamp(0.0, 1.0);
+      return FadeTransition(
+        opacity: fade,
+        child: ScaleTransition(
+          scale: scale,
+          alignment: Alignment.center,
+          child: child,
+        ),
+      );
+    },
+  );
+}
 
-          return FadeTransition(
-            opacity: AlwaysStoppedAnimation(opacity),
-            child: Transform.translate(
-              offset: Offset(dx, dy),
-              child: Transform.scale(
-                scale: scale,
-                alignment: Alignment.topCenter,
-                child: Stack(
-                  fit: StackFit.passthrough,
-                  children: [
-                    child,
-                    if (depth > 0)
-                      Positioned.fill(
-                        child: IgnorePointer(
-                          child: ColoredBox(
-                            color: const Color(0xFF004D40)
-                                .withValues(alpha: 0.1 * depth),
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        },
+/// Smooth flowing zoom for dialogs and popups (save confirm, saved bill, etc.).
+Future<T?> showAppDialog<T>({
+  required BuildContext context,
+  required WidgetBuilder builder,
+  bool barrierDismissible = true,
+  Color? barrierColor,
+}) {
+  return showGeneralDialog<T>(
+    context: context,
+    barrierDismissible: barrierDismissible,
+    barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+    barrierColor: barrierColor ?? Colors.black54,
+    transitionDuration: const Duration(milliseconds: 520),
+    pageBuilder: (context, animation, secondaryAnimation) => builder(context),
+    transitionBuilder: (context, animation, secondaryAnimation, child) {
+      final enter = CurvedAnimation(
+        parent: animation,
+        curve: const Cubic(0.16, 1.0, 0.3, 1.0),
+        reverseCurve: Curves.easeInCubic,
+      );
+      final scale = Tween<double>(begin: 0.78, end: 1.0).animate(enter);
+      final fade = Tween<double>(begin: 0.0, end: 1.0).animate(
+        CurvedAnimation(
+          parent: animation,
+          curve: const Interval(0.0, 0.9, curve: Curves.easeOut),
+          reverseCurve: const Interval(0.1, 1.0, curve: Curves.easeIn),
+        ),
+      );
+      final slide = Tween<Offset>(
+        begin: const Offset(0, 0.06),
+        end: Offset.zero,
+      ).animate(enter);
+
+      return FadeTransition(
+        opacity: fade,
+        child: SlideTransition(
+          position: slide,
+          child: ScaleTransition(
+            scale: scale,
+            alignment: Alignment.center,
+            child: child,
+          ),
+        ),
       );
     },
   );
@@ -2933,7 +3173,7 @@ void showAppSnack(
         backgroundColor: success ? _kSnackSuccess : _kSnackError,
         behavior: SnackBarBehavior.floating,
         margin: EdgeInsets.fromLTRB(12, 0, 12, keyboardBottom + 12),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         elevation: 4,
         duration: const Duration(seconds: 3),
       ),
@@ -2951,35 +3191,58 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<String>(
-      valueListenable: AppDrawTheme.activeDraw,
-      builder: (context, draw, _) {
-        final accent = _drawColorForTime(draw);
-        return MaterialApp(
-          debugShowCheckedModeBanner: false,
-          theme: ThemeData(
-            primaryColor: accent,
-            colorScheme: ColorScheme.fromSeed(
-              seedColor: accent,
-              brightness: Brightness.light,
-            ),
-            appBarTheme: AppBarTheme(
-              backgroundColor: accent,
-              foregroundColor: Colors.white,
-              systemOverlayStyle: SystemUiOverlayStyle(
-                statusBarColor: accent,
-                statusBarIconBrightness: Brightness.light,
-                statusBarBrightness: Brightness.dark,
+    return ValueListenableBuilder<AppLanguage>(
+      valueListenable: AppLocale.language,
+      builder: (context, lang, _) {
+        return ValueListenableBuilder<String>(
+          valueListenable: AppDrawTheme.activeDraw,
+          builder: (context, draw, __) {
+            return MaterialApp(
+              debugShowCheckedModeBanner: false,
+              locale: Locale(lang.name),
+              theme: ThemeData(
+                primaryColor: kAppBlue,
+                scaffoldBackgroundColor: Colors.white,
+                colorScheme: ColorScheme.fromSeed(
+                  seedColor: kAppBlue,
+                  primary: kAppBlue,
+                  secondary: kAppBlueLight,
+                  surface: Colors.white,
+                  brightness: Brightness.light,
+                ),
+                appBarTheme: const AppBarTheme(
+                  backgroundColor: kAppBlue,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  surfaceTintColor: Colors.transparent,
+                  systemOverlayStyle: SystemUiOverlayStyle(
+                    statusBarColor: kAppBlue,
+                    statusBarIconBrightness: Brightness.light,
+                    statusBarBrightness: Brightness.dark,
+                  ),
+                ),
+                elevatedButtonTheme: ElevatedButtonThemeData(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kAppBlue,
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+                checkboxTheme: CheckboxThemeData(
+                  fillColor: WidgetStateProperty.resolveWith((states) {
+                    if (states.contains(WidgetState.selected)) return kAppBlue;
+                    return null;
+                  }),
+                ),
               ),
-            ),
-          ),
-          home: HavellsShellPage(
-            onSecretLogin: (context) {
-              Navigator.push(context, appRoute(const LoginPage()));
-            },
-          ),
-          routes: {
-            '/login': (_) => const LoginPage(),
+              home: HavellsShellPage(
+                onSecretLogin: (context) {
+                  Navigator.push(context, appRoute(const LoginPage()));
+                },
+              ),
+              routes: {
+                '/login': (_) => const LoginPage(),
+              },
+            );
           },
         );
       },
@@ -3017,7 +3280,7 @@ class _LoginPageState extends State<LoginPage> {
       final userMap = Map<String, dynamic>.from(loginRes['user'] as Map);
       if (userMap['isBlocked'] == true) {
         setState(() {
-          message = "Your account is blocked. Please contact admin.";
+          message = AppMsg.accountBlocked;
           _loading = false;
         });
         return;
@@ -3044,7 +3307,7 @@ class _LoginPageState extends State<LoginPage> {
       final serverUp = await ApiService.healthCheck();
       if (serverUp) {
         setState(() {
-          message = "Cloud login failed: ${e.message}";
+          message = AppMsg.cloudLoginFailed(e.message);
           _loading = false;
         });
         return;
@@ -3053,7 +3316,7 @@ class _LoginPageState extends State<LoginPage> {
       if (user != null) {
         if (user.isBlocked) {
           setState(() {
-            message = "Your account is blocked. Please contact admin.";
+            message = AppMsg.accountBlocked;
             _loading = false;
           });
           return;
@@ -3068,13 +3331,13 @@ class _LoginPageState extends State<LoginPage> {
         );
       } else {
         setState(() {
-          message = "Wrong Username or Password";
+          message = AppMsg.wrongCredentials;
           _loading = false;
         });
       }
     } catch (e) {
       setState(() {
-        message = "Login failed: $e";
+        message = AppMsg.loginFailed(e);
         _loading = false;
       });
     } finally {
@@ -3129,7 +3392,7 @@ class _LoginPageState extends State<LoginPage> {
                       padding: const EdgeInsets.fromLTRB(22, 28, 22, 24),
                       decoration: BoxDecoration(
                         color: Colors.white,
-                        borderRadius: BorderRadius.circular(12),
+                        borderRadius: BorderRadius.zero,
                         boxShadow: [
                           BoxShadow(
                             color: Colors.black.withValues(alpha: 0.08),
@@ -3149,14 +3412,6 @@ class _LoginPageState extends State<LoginPage> {
                               color: Color(0xFF212121),
                             ),
                           ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Enter your credentials to continue',
-                            style: TextStyle(
-                              fontSize: 14,
-                              color: Colors.grey[600],
-                            ),
-                          ),
                           const SizedBox(height: 28),
                           TextField(
                             onChanged: (value) => username = value,
@@ -3165,10 +3420,10 @@ class _LoginPageState extends State<LoginPage> {
                               labelText: 'Username',
                               prefixIcon: const Icon(Icons.person_outline),
                               border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(8),
+                                borderRadius: BorderRadius.zero,
                               ),
                               focusedBorder: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(8),
+                                borderRadius: BorderRadius.zero,
                                 borderSide: const BorderSide(
                                   color: _havellsRed,
                                   width: 1.5,
@@ -3198,10 +3453,10 @@ class _LoginPageState extends State<LoginPage> {
                                 ),
                               ),
                               border: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(8),
+                                borderRadius: BorderRadius.zero,
                               ),
                               focusedBorder: OutlineInputBorder(
-                                borderRadius: BorderRadius.circular(8),
+                                borderRadius: BorderRadius.zero,
                                 borderSide: const BorderSide(
                                   color: _havellsRed,
                                   width: 1.5,
@@ -3220,7 +3475,7 @@ class _LoginPageState extends State<LoginPage> {
                                 disabledBackgroundColor:
                                     _havellsRed.withValues(alpha: 0.5),
                                 shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8),
+                                  borderRadius: BorderRadius.zero,
                                 ),
                                 textStyle: const TextStyle(
                                   fontWeight: FontWeight.w700,
@@ -3308,6 +3563,7 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final isAdmin = AppSession.role == "ADMIN";
+    final menuLite = menuDrawLiteColor(_selectedDraw);
     return Scaffold(
       body: Container(
         decoration: _reportPageBgDecoration(),
@@ -3329,84 +3585,102 @@ class _HomePageState extends State<HomePage> {
                 },
               ),
               const SizedBox(height: 12),
-              _simpleMenuCard([
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.add_circle_outline,
-                  title: 'Add Ticket',
-                  onTap: () => _openAddTicket(
-                    context,
-                    widget.username,
-                    _selectedDraw,
-                  ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.bar_chart_outlined,
-                  title: 'Reports',
-                  onTap: () => Navigator.push(
-                    context,
-                    appRoute(const ReportsPage()),
-                  ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.emoji_events_outlined,
-                  title: 'Results',
-                  onTap: () => Navigator.push(
-                    context,
-                    appRoute(const DearResultPage()),
-                  ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.list_alt_outlined,
-                  title: 'Price List',
-                  onTap: () => Navigator.push(
-                    context,
-                    appRoute(const PriceListPage()),
-                  ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.edit_outlined,
-                  title: 'Edit / Delete',
-                  onTap: () => Navigator.push(
-                    context,
-                    appRoute(const EditBillPage()),
-                  ),
-                ),
-                if (isAdmin)
+              _simpleMenuCard(
+                [
                   _simpleMenuTile(
                     context,
-                    icon: Icons.filter_3_outlined,
-                    title: 'Digit Count Limits',
-                    onTap: () => Navigator.push(
+                    rowColor: menuLite,
+                    icon: Icons.add_circle_outline,
+                    title: 'Add Ticket',
+                    onTap: () => _openAddTicket(
                       context,
-                      appRoute(const DigitCountLimitsPage()),
+                      widget.username,
+                      _selectedDraw,
                     ),
                   ),
-                if (isAdmin)
                   _simpleMenuTile(
                     context,
-                    icon: Icons.schedule_outlined,
-                    title: 'Draw Timings',
+                    rowColor: menuLite,
+                    icon: Icons.bar_chart_outlined,
+                    title: 'Reports',
                     onTap: () => Navigator.push(
                       context,
-                      appRoute(const DrawSchedulePage()),
+                      appRoute(const ReportsPage()),
                     ),
                   ),
-                if (isAdmin)
                   _simpleMenuTile(
                     context,
-                    icon: Icons.people_outline,
-                    title: 'Manage Users',
+                    rowColor: menuLite,
+                    icon: Icons.emoji_events_outlined,
+                    title: 'Results',
                     onTap: () => Navigator.push(
                       context,
-                      appRoute(const ManageUsersPage()),
+                      appRoute(const DearResultPage()),
                     ),
                   ),
-              ]),
+                  _simpleMenuTile(
+                    context,
+                    rowColor: menuLite,
+                    icon: Icons.list_alt_outlined,
+                    title: 'Prize And Commission',
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const PriceListPage()),
+                    ),
+                  ),
+                  _simpleMenuTile(
+                    context,
+                    rowColor: menuLite,
+                    icon: Icons.edit_outlined,
+                    title: 'Edit / Delete',
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const EditBillPage()),
+                    ),
+                  ),
+                  if (isAdmin)
+                    _simpleMenuTile(
+                      context,
+                      rowColor: menuLite,
+                      icon: Icons.filter_3_outlined,
+                      title: 'Digit Count Limits',
+                      onTap: () => Navigator.push(
+                        context,
+                        appRoute(const DigitCountLimitsPage()),
+                      ),
+                    ),
+                  if (isAdmin)
+                    _simpleMenuTile(
+                      context,
+                      rowColor: menuLite,
+                      icon: Icons.schedule_outlined,
+                      title: 'Draw Timings',
+                      onTap: () => Navigator.push(
+                        context,
+                        appRoute(const DrawSchedulePage()),
+                      ),
+                    ),
+                  if (isAdmin)
+                    _simpleMenuTile(
+                      context,
+                      rowColor: menuLite,
+                      icon: Icons.people_outline,
+                      title: 'Manage Users',
+                      onTap: () => Navigator.push(
+                        context,
+                        appRoute(const ManageUsersPage()),
+                      ),
+                    ),
+                  _simpleMenuTile(
+                    context,
+                    rowColor: menuLite,
+                    icon: Icons.language_outlined,
+                    title: AppMsg.menuLanguage,
+                    onTap: () => showLanguagePicker(context),
+                  ),
+                ],
+                flat: true,
+              ),
             ],
           ),
         ),
@@ -3420,93 +3694,133 @@ Widget _simpleMenuTile(
   required IconData icon,
   required String title,
   required VoidCallback onTap,
+  Color? rowColor,
+  Color? borderColor,
 }) {
-  return InkWell(
-    onTap: onTap,
-    child: Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
-      child: Row(
-        children: [
-          Icon(icon, size: 22, color: _appPrimary),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Text(
-              title,
-              style: const TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w500,
-                color: Color(0xFF263238),
+  final edge = borderColor ?? Colors.grey.shade400;
+  return DecoratedBox(
+    decoration: BoxDecoration(
+      color: rowColor ?? Colors.transparent,
+      border: rowColor != null
+          ? Border(
+              bottom: BorderSide(color: edge, width: 1.5),
+            )
+          : null,
+    ),
+    child: Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                color: kMenuIconMazha,
+                alignment: Alignment.center,
+                child: Icon(icon, size: 22, color: Colors.white),
               ),
-            ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w500,
+                    color: Color(0xFF263238),
+                  ),
+                ),
+              ),
+              Icon(Icons.chevron_right, size: 20, color: kMenuIconMazha),
+            ],
           ),
-          Icon(Icons.chevron_right, size: 20, color: Colors.grey.shade400),
-        ],
+        ),
       ),
     ),
   );
 }
 
-Widget _simpleMenuCard(List<Widget> items) {
+Widget _simpleMenuCard(
+  List<Widget> items, {
+  bool flat = true,
+}) {
   return Container(
-    decoration: BoxDecoration(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: Colors.grey.shade200),
+    decoration: const BoxDecoration(
+      color: Colors.transparent,
     ),
-    clipBehavior: Clip.antiAlias,
+    clipBehavior: Clip.none,
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        for (int i = 0; i < items.length; i++) ...[
-          if (i > 0) Divider(height: 1, color: Colors.grey.shade200),
-          items[i],
-        ],
+        for (int i = 0; i < items.length; i++) items[i],
       ],
     ),
   );
 }
 
-const Color _reportBg = Color(0xFFF4F8F7);
+Future<void> showLanguagePicker(BuildContext context) async {
+  final current = AppLocale.language.value;
+  final picked = await showAppDialog<AppLanguage>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(AppMsg.languageTitle),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final lang in AppLanguage.values)
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text(
+                AppLocale.nativeLabel(lang),
+                style: TextStyle(
+                  fontWeight:
+                      lang == current ? FontWeight.w700 : FontWeight.w500,
+                ),
+              ),
+              trailing: lang == current
+                  ? const Icon(Icons.check, color: kAppBlue)
+                  : null,
+              onTap: () => Navigator.pop(ctx, lang),
+            ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: Text(AppMsg.cancel),
+        ),
+      ],
+    ),
+  );
+  if (picked == null || picked == current) return;
+  await AppLocale.setLanguage(picked);
+  if (context.mounted) {
+    showSuccessSnack(context, AppMsg.languageChanged);
+  }
+}
+
+const Color _reportBg = kAppSurface;
 
 BoxDecoration _appGradientBox({BorderRadius? radius}) {
   return BoxDecoration(
-    gradient: LinearGradient(
-      colors: _appGradient,
-      begin: Alignment.topLeft,
-      end: Alignment.bottomRight,
-    ),
-    borderRadius: radius ?? BorderRadius.circular(8),
+    color: kAppBlue,
+    borderRadius: radius ?? BorderRadius.zero,
   );
 }
 
 Decoration _reportPageBgDecoration() {
-  return BoxDecoration(
-    gradient: LinearGradient(
-      begin: Alignment.topCenter,
-      end: Alignment.bottomCenter,
-      colors: [
-        _appGradient.first.withValues(alpha: 0.14),
-        _reportBg,
-        Colors.white,
-      ],
-    ),
-  );
+  return const BoxDecoration(color: kAppSurface);
 }
 
-Widget _reportFormCard(Widget child) {
+Widget _reportFormCard(Widget child, {bool flat = true}) {
   return Container(
     padding: const EdgeInsets.all(14),
     decoration: BoxDecoration(
       color: Colors.white,
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: _appGradient.first.withValues(alpha: 0.15)),
-      boxShadow: [
-        BoxShadow(
-          color: _appGradient.last.withValues(alpha: 0.06),
-          blurRadius: 8,
-          offset: const Offset(0, 2),
-        ),
-      ],
+      border: Border.all(color: Colors.grey.shade300),
     ),
     child: child,
   );
@@ -3515,9 +3829,11 @@ Widget _reportFormCard(Widget child) {
 Widget _appGradientButton({
   required VoidCallback? onPressed,
   required Widget child,
+  bool flat = true,
 }) {
+  const radius = BorderRadius.zero;
   return DecoratedBox(
-    decoration: _appGradientBox(radius: BorderRadius.circular(8)),
+    decoration: _appGradientBox(radius: radius),
     child: ElevatedButton(
       onPressed: onPressed,
       style: ElevatedButton.styleFrom(
@@ -3526,7 +3842,7 @@ Widget _appGradientButton({
         foregroundColor: Colors.white,
         padding: const EdgeInsets.symmetric(vertical: 13),
         minimumSize: const Size(double.infinity, 48),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        shape: const RoundedRectangleBorder(borderRadius: radius),
         textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
       ),
       child: child,
@@ -3539,6 +3855,7 @@ AppBar _reportAppBar(
   BuildContext context, {
   VoidCallback? onBack,
   bool showLogout = false,
+  List<Widget>? extraActions,
 }) {
   return AppBar(
     leading: onBack != null
@@ -3556,21 +3873,13 @@ AppBar _reportAppBar(
         fontSize: 17,
       ),
     ),
-    backgroundColor: _appGradient.first,
+    backgroundColor: kAppBlue,
     foregroundColor: Colors.white,
     elevation: 0,
     surfaceTintColor: Colors.transparent,
-    flexibleSpace: Container(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: _appGradient,
-          begin: Alignment.centerLeft,
-          end: Alignment.centerRight,
-        ),
-      ),
-    ),
     iconTheme: const IconThemeData(color: Colors.white),
     actions: [
+      if (extraActions != null) ...extraActions,
       IconButton(
         onPressed: () =>
             showLogout ? logoutApp(context) : goToMainHome(context),
@@ -3584,38 +3893,113 @@ AppBar _reportAppBar(
   );
 }
 
-const Color kDraw1PmColor = Color(0xFF818894);
-const Color kDraw3PmColor = Color(0xFF2F271C);
-const Color kDraw6PmColor = Color(0xFFCC5D25);
-const Color kDraw8PmColor = Color(0xFF7F9651);
+const Color kDraw1PmColor = Color(0xFF1F4E79); // D1 — deep navy blue
+const Color kDraw1PmColorDark = Color(0xFF153A5C);
+const Color kDraw3PmColor = Color(0xFFC55A11); // L3 — burnt orange
+const Color kDraw3PmColorDark = Color(0xFF9A4310);
+const Color kDraw6PmColor = Color(0xFF7030A0); // D6 — plum purple
+const Color kDraw6PmColorDark = Color(0xFF552474);
+const Color kDraw8PmColor = Color(0xFF385723); // D8 — dark green
+const Color kDraw8PmColorDark = Color(0xFF2A4018);
+
+/// App-wide blue / white theme (matches booking page).
+const Color kAppBlue = Color(0xFF0B3D7A);
+const Color kAppBlueDark = Color(0xFF062952);
+const Color kAppBlueLight = Color(0xFF1565C0);
+const Color kAppSurface = Color(0xFFF5F8FC);
+const List<Color> kAppBlueGradient = [
+  kAppBlue,
+  kAppBlue,
+];
+
+const Color kMenuDrawDear1 = kDraw1PmColor;
+const Color kMenuDrawLsk3 = kDraw3PmColor;
+const Color kMenuDrawDear6 = kDraw6PmColor;
+const Color kMenuDrawDear8 = kDraw8PmColor;
+
+const Color kMenuDrawDear1Lite = Color(0xFFBCD2E8);
+const Color kMenuDrawLsk3Lite = Color(0xFFF0D4BC);
+const Color kMenuDrawDear6Lite = Color(0xFFE0C8ED);
+const Color kMenuDrawDear8Lite = Color(0xFFC8D9BC);
+
+const Color kMenuIconMazha = Color(0xFF51154A);
+
+String menuDrawShortLabel(String draw) {
+  switch (draw.trim()) {
+    case 'DEAR 1 PM':
+      return 'D-1:00PM';
+    case 'LSK 3 PM':
+      return 'K-3:00PM';
+    case 'DEAR 6 PM':
+      return 'D-6:00PM';
+    case 'DEAR 8 PM':
+      return 'D-8:00PM';
+    default:
+      return draw;
+  }
+}
+
+Color menuDrawColor(String drawTime) => _drawColorForTime(drawTime);
+
+Color menuDrawLiteColor(String drawTime) => _drawLiteColorForTime(drawTime);
+
+Color _drawLiteColorForTime(String drawTime) {
+  switch (drawTime.trim()) {
+    case "DEAR 1 PM":
+      return kMenuDrawDear1Lite;
+    case "LSK 3 PM":
+      return kMenuDrawLsk3Lite;
+    case "DEAR 6 PM":
+      return kMenuDrawDear6Lite;
+    case "DEAR 8 PM":
+      return kMenuDrawDear8Lite;
+    default:
+      return kAppBlue.withValues(alpha: 0.12);
+  }
+}
+
+Color _drawLiteColorForCode(String code) {
+  switch (code.toUpperCase()) {
+    case "DEAR1":
+      return kMenuDrawDear1Lite;
+    case "LSK3":
+      return kMenuDrawLsk3Lite;
+    case "DEAR6":
+      return kMenuDrawDear6Lite;
+    case "DEAR8":
+      return kMenuDrawDear8Lite;
+    default:
+      return kAppBlue.withValues(alpha: 0.12);
+  }
+}
 
 Color _drawColorForTime(String drawTime) {
   switch (drawTime.trim()) {
     case "DEAR 1 PM":
-      return kDraw1PmColor;
+      return kMenuDrawDear1;
     case "LSK 3 PM":
-      return kDraw3PmColor;
+      return kMenuDrawLsk3;
     case "DEAR 6 PM":
-      return kDraw6PmColor;
+      return kMenuDrawDear6;
     case "DEAR 8 PM":
-      return kDraw8PmColor;
+      return kMenuDrawDear8;
     default:
-      return kDraw3PmColor;
+      return kAppBlue;
   }
 }
 
 Color _drawColorForCode(String code) {
   switch (code.toUpperCase()) {
     case "DEAR1":
-      return kDraw1PmColor;
+      return kMenuDrawDear1;
     case "LSK3":
-      return kDraw3PmColor;
+      return kMenuDrawLsk3;
     case "DEAR6":
-      return kDraw6PmColor;
+      return kMenuDrawDear6;
     case "DEAR8":
-      return kDraw8PmColor;
+      return kMenuDrawDear8;
     default:
-      return const Color(0xFF546E7A);
+      return kAppBlue;
   }
 }
 
@@ -3629,16 +4013,25 @@ Color _drawColorForTypePrefix(String type) {
 }
 
 List<Color> _drawGradientForTime(String drawTime) {
-  final base = _drawColorForTime(drawTime);
-  return [base, Color.lerp(base, Colors.black, 0.22)!];
+  switch (drawTime.trim()) {
+    case "DEAR 1 PM":
+      return [kDraw1PmColor, kDraw1PmColorDark];
+    case "LSK 3 PM":
+      return [kDraw3PmColor, kDraw3PmColorDark];
+    case "DEAR 6 PM":
+      return [kDraw6PmColor, kDraw6PmColorDark];
+    case "DEAR 8 PM":
+      return [kDraw8PmColor, kDraw8PmColorDark];
+    default:
+      final base = _drawColorForTime(drawTime);
+      return [base, base];
+  }
 }
 
 List<Color> _drawLightGradientForTime(String drawTime) {
   final base = _drawColorForTime(drawTime);
-  return [
-    Color.lerp(base, Colors.white, 0.88)!,
-    Color.lerp(base, Colors.white, 0.82)!,
-  ];
+  final light = Color.lerp(base, Colors.white, 0.85)!;
+  return [light, light];
 }
 
 /// Active draw tint for app chrome — follows menu selection or open-time draw.
@@ -3673,17 +4066,18 @@ class AppDrawTheme {
   }
 }
 
-Color get _appPrimary => _drawColorForTime(AppDrawTheme.activeDraw.value);
+Color get _appPrimary => kAppBlue;
 
-List<Color> get _appGradient =>
-    _drawGradientForTime(AppDrawTheme.activeDraw.value);
+List<Color> get _appGradient => kAppBlueGradient;
 
 Color get _salesAccent => _appPrimary;
 
 Color _salesDrawColor(String code) => _drawColorForCode(code);
 
 Color _salesDrawTint(String code) =>
-    _salesDrawColor(code).withValues(alpha: 0.12);
+    code == 'ALL'
+        ? kAppBlue.withValues(alpha: 0.12)
+        : _drawLiteColorForCode(code);
 
 String _salesDrawLabel(String code) {
   switch (code) {
@@ -3700,21 +4094,47 @@ String _salesDrawLabel(String code) {
   }
 }
 
+String _drawCodeFromRowType(String type) {
+  final t = type.toUpperCase();
+  if (t.startsWith('LSK3')) return 'LSK3';
+  if (t.startsWith('DEAR6')) return 'DEAR6';
+  if (t.startsWith('DEAR8')) return 'DEAR8';
+  if (t.startsWith('DEAR1')) return 'DEAR1';
+  return 'ALL';
+}
+
+Color _salesRowTypeColor(String type) =>
+    _salesDrawColor(_drawCodeFromRowType(type));
+
+String _salesRowTypeDisplayLabel(String type) {
+  final drawCode = _drawCodeFromRowType(type);
+  final suffix = schemeSuffixFromName(type).toUpperCase();
+  final pm = switch (drawCode) {
+    'DEAR1' => '1PM',
+    'LSK3' => '3PM',
+    'DEAR6' => '6PM',
+    'DEAR8' => '8PM',
+    _ => '',
+  };
+  if (pm.isEmpty) return type;
+  if (suffix == 'BOX') return 'Box-$pm';
+  if (suffix == 'SUPER' || suffix == 'DC') {
+    return drawCode == 'LSK3' ? 'K-$pm' : 'DEAR-$pm';
+  }
+  return '$suffix-$pm';
+}
+
 Widget _salesDrawBar({
   required String selected,
   required ValueChanged<String> onChanged,
+  bool flat = true,
 }) {
   const options = ["ALL", "DEAR1", "LSK3", "DEAR6", "DEAR8"];
   return Container(
     padding: const EdgeInsets.all(4),
     decoration: BoxDecoration(
-      gradient: LinearGradient(
-        colors: [
-          _appGradient.first.withValues(alpha: 0.12),
-          _appGradient.last.withValues(alpha: 0.08),
-        ],
-      ),
-      borderRadius: BorderRadius.circular(10),
+      color: kAppBlue.withValues(alpha: 0.1),
+      border: Border.all(color: Colors.grey.shade300),
     ),
     child: Row(
       children: options.map((d) {
@@ -3725,27 +4145,11 @@ Widget _salesDrawBar({
             color: Colors.transparent,
             child: InkWell(
               onTap: () => onChanged(d),
-              borderRadius: BorderRadius.circular(8),
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 150),
                 padding: const EdgeInsets.symmetric(vertical: 9),
                 decoration: BoxDecoration(
-                  gradient: sel
-                      ? LinearGradient(
-                          colors: [c, c.withValues(alpha: 0.75)],
-                        )
-                      : null,
-                  color: sel ? null : Colors.transparent,
-                  borderRadius: BorderRadius.circular(8),
-                  boxShadow: sel
-                      ? [
-                          BoxShadow(
-                            color: c.withValues(alpha: 0.25),
-                            blurRadius: 4,
-                            offset: const Offset(0, 1),
-                          ),
-                        ]
-                      : null,
+                  color: sel ? c : Colors.transparent,
                 ),
                 child: Text(
                   _salesDrawLabel(d),
@@ -3765,15 +4169,19 @@ Widget _salesDrawBar({
   );
 }
 
-InputDecoration _salesFieldDecoration(String label) {
+InputDecoration _salesFieldDecoration(String label, {bool flat = true}) {
+  final side = BorderSide(color: Colors.grey.shade300);
   return InputDecoration(
     labelText: label,
     labelStyle: TextStyle(color: Colors.grey.shade600, fontSize: 14),
     filled: true,
-    fillColor: const Color(0xFFF5F7FA),
-    border: OutlineInputBorder(
-      borderRadius: BorderRadius.circular(8),
-      borderSide: BorderSide.none,
+    fillColor: Colors.white,
+    border: OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: side),
+    enabledBorder:
+        OutlineInputBorder(borderRadius: BorderRadius.zero, borderSide: side),
+    focusedBorder: OutlineInputBorder(
+      borderRadius: BorderRadius.zero,
+      borderSide: BorderSide(color: _appPrimary, width: 1.5),
     ),
     contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
   );
@@ -3784,13 +4192,9 @@ Widget _salesStatChip(String label, String value, Color bg) {
     child: Container(
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [bg, Colors.white],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: _appGradient.first.withValues(alpha: 0.12)),
+        color: bg.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.zero,
+        border: Border.all(color: kAppBlue.withValues(alpha: 0.12)),
       ),
       child: Column(
         children: [
@@ -3815,7 +4219,7 @@ Widget _salesDrawStatChip(String label, String value, Color drawColor) {
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
       decoration: BoxDecoration(
         color: drawColor,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.zero,
         border: Border.all(color: drawColor.withValues(alpha: 0.85)),
       ),
       child: Column(
@@ -3902,12 +4306,13 @@ bool _billMatchesReportUserFilter(BillRecord bill, String userFilter) {
       userFilter.trim().toLowerCase();
 }
 
-InputDecoration _reportUserFilterDecoration() =>
-    _salesFieldDecoration('User');
+InputDecoration _reportUserFilterDecoration({bool flat = false}) =>
+    _salesFieldDecoration('User', flat: flat);
 
 Widget _reportUserFilterDropdown({
   required String value,
   required ValueChanged<String> onChanged,
+  bool flat = false,
 }) {
   return ValueListenableBuilder<List<AppUser>>(
     valueListenable: UserStore.users,
@@ -3916,7 +4321,7 @@ Widget _reportUserFilterDropdown({
       final selected = options.contains(value) ? value : options.first;
       return DropdownButtonFormField<String>(
         initialValue: selected,
-        decoration: _reportUserFilterDecoration(),
+        decoration: _reportUserFilterDecoration(flat: flat),
         items: [
           for (final name in options)
             DropdownMenuItem(
@@ -3936,7 +4341,14 @@ const Color _winningGreen = Color(0xFF2E7D32);
 const Color _winningGreenLight = Color(0xFFE8F5E9);
 const Color _winningGreenDark = Color(0xFF1B5E20);
 
-const List<Color> _kResultPrizeColors = kResultTemplatePrizeColors;
+/// Lite pastel bands for winning report rows (1st–5th prize).
+const List<Color> _kWinningPrizeLiteColors = [
+  Color(0xFFBDE8B8), // 1st — lite green
+  Color(0xFFB3D4F5), // 2nd — lite blue
+  Color(0xFFDCC0E8), // 3rd — lite purple
+  Color(0xFFFFD4A8), // 4th — lite orange
+  Color(0xFFB8C8E8), // 5th — lite navy
+];
 
 const Color _kComplimentsHeadingGrey = Color(0xFF424242);
 const Color _kComplimentsHeadingBg = Color(0xFFF5F6F8);
@@ -3979,7 +4391,7 @@ Widget _winningStatChip(String label, String value, Color drawColor) {
       padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
       decoration: BoxDecoration(
         color: drawColor,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.zero,
         border: Border.all(color: drawColor.withValues(alpha: 0.85)),
       ),
       child: Column(
@@ -4047,17 +4459,19 @@ Widget _winningDataRow(Map<String, dynamic> row) {
   final prizeLabel = row['winningPrizeLabel']?.toString();
   final billNo = row['winningBillNo']?.toString();
   final billUser = row['winningBillUser']?.toString();
+  final billNote = row['winningBillNote']?.toString().trim() ?? '';
 
   return Container(
-    margin: const EdgeInsets.fromLTRB(12, 4, 12, 4),
-    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+    width: double.infinity,
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
     decoration: BoxDecoration(
       color: palette.bg,
-      borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: palette.borderColor),
+      border: Border(
+        bottom: BorderSide(color: palette.borderColor, width: 0.8),
+      ),
     ),
     child: Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Expanded(
           flex: 4,
@@ -4073,7 +4487,6 @@ Widget _winningDataRow(Map<String, dynamic> row) {
                   letterSpacing: prizeLabel != null ? 0.35 : 0,
                   color: palette.labelColor,
                 ),
-                overflow: TextOverflow.ellipsis,
               ),
               if (billNo != null && billNo.isNotEmpty)
                 Text(
@@ -4083,8 +4496,29 @@ Widget _winningDataRow(Map<String, dynamic> row) {
                     fontWeight: FontWeight.w600,
                     color: palette.labelColor.withValues(alpha: 0.72),
                   ),
-                  overflow: TextOverflow.ellipsis,
                 ),
+              if (billNote.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  'Bill Note',
+                  style: TextStyle(
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.3,
+                    color: palette.labelColor.withValues(alpha: 0.65),
+                  ),
+                ),
+                Text(
+                  billNote,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: palette.labelColor,
+                    height: 1.25,
+                  ),
+                  softWrap: true,
+                ),
+              ],
               if (prizeLabel != null)
                 Text(
                   row['type'].toString(),
@@ -4092,7 +4526,6 @@ Widget _winningDataRow(Map<String, dynamic> row) {
                     fontSize: 10,
                     color: palette.labelColor.withValues(alpha: 0.65),
                   ),
-                  overflow: TextOverflow.ellipsis,
                 ),
             ],
           ),
@@ -4177,12 +4610,15 @@ String _winningDigitSectionLabel(int tier) {
 
 Widget _winningDigitSectionHeader(String label) {
   return Container(
-    margin: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+    width: double.infinity,
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
     decoration: BoxDecoration(
       color: _kComplimentsHeadingBg,
-      borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: _kComplimentBorderColor.withValues(alpha: 0.45)),
+      border: Border(
+        bottom: BorderSide(
+          color: _kComplimentBorderColor.withValues(alpha: 0.45),
+        ),
+      ),
     ),
     child: Text(
       label,
@@ -4218,15 +4654,18 @@ List<Widget> _buildGroupedWinningRowWidgets(
   return widgets;
 }
 
-InputDecoration _winningGroupDecoration() => _salesFieldDecoration("Group");
+InputDecoration _winningGroupDecoration({bool flat = false}) =>
+    _salesFieldDecoration("Group", flat: flat);
 
-InputDecoration _winningModeDecoration() => _salesFieldDecoration("Mode");
+InputDecoration _winningModeDecoration({bool flat = false}) =>
+    _salesFieldDecoration("Mode", flat: flat);
 
 Widget _reportDateBox(
   BuildContext context, {
   required String label,
   required DateTime value,
   required ValueChanged<DateTime> onChanged,
+  bool flat = false,
 }) {
   return InkWell(
     onTap: () async {
@@ -4239,7 +4678,7 @@ Widget _reportDateBox(
       if (picked != null) onChanged(_calendarDate(picked));
     },
     child: InputDecorator(
-      decoration: _salesFieldDecoration(label),
+      decoration: _salesFieldDecoration(label, flat: flat),
       child: Text(
         "${value.day.toString().padLeft(2, "0")}/${value.month.toString().padLeft(2, "0")}/${value.year}",
         textAlign: TextAlign.center,
@@ -4266,6 +4705,51 @@ Widget _reportPage({
     ),
   );
 }
+
+Future<void> showBookingWhatsappPhoneEditor(BuildContext context) async {
+  final controller =
+      TextEditingController(text: BookingContactStore.whatsappPhone.value);
+  try {
+    final phone = await showAppDialog<String?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Booking WhatsApp Phone'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.phone,
+          decoration: const InputDecoration(
+            labelText: 'Phone number',
+            hintText: 'e.g. 9876543210',
+          ),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: Text(AppMsg.cancel),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: Text(AppMsg.save),
+          ),
+        ],
+      ),
+    );
+    if (phone != null) {
+      await BookingContactStore.setWhatsappPhone(phone);
+      if (context.mounted) {
+        showSuccessSnack(context, 'Booking WhatsApp phone saved');
+      }
+    }
+  } finally {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      controller.dispose();
+    });
+  }
+}
+
+String _bookingWhatsappPhoneForViewer(String phone) =>
+    AppSession.role == 'ADMIN' ? phone.trim() : '';
 
 const List<DropdownMenuItem<String>> _winningGroupItems = [
   DropdownMenuItem(value: "Select", child: Text("All")),
@@ -4459,7 +4943,7 @@ class _EditUserPageState extends State<EditUserPage> {
     setState(() => _saving = false);
     showAppSnack(
       context,
-      success ? 'User updated' : 'Update failed',
+      success ? AppMsg.userUpdated : AppMsg.updateFailed,
       success: success,
     );
     if (success) {
@@ -4483,13 +4967,8 @@ class _EditUserPageState extends State<EditUserPage> {
                   Container(
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [
-                          _appGradient.first.withValues(alpha: 0.85),
-                          _appGradient.last,
-                        ],
-                      ),
-                      borderRadius: BorderRadius.circular(10),
+                      color: kAppBlue,
+                      borderRadius: BorderRadius.zero,
                     ),
                     child: const Icon(
                       Icons.edit_outlined,
@@ -4507,13 +4986,6 @@ class _EditUserPageState extends State<EditUserPage> {
                           style: const TextStyle(
                             fontWeight: FontWeight.w700,
                             fontSize: 17,
-                          ),
-                        ),
-                        Text(
-                          'Edit account details',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade600,
                           ),
                         ),
                       ],
@@ -4534,9 +5006,7 @@ class _EditUserPageState extends State<EditUserPage> {
               TextField(
                 controller: passwordCtrl,
                 obscureText: true,
-                decoration: _salesFieldDecoration(
-                  'New Password (leave blank to keep)',
-                ),
+                decoration: _salesFieldDecoration('New Password'),
               ),
               if (!_isSelf) ...[
                 const SizedBox(height: 10),
@@ -4608,28 +5078,28 @@ class _EditUserPageState extends State<EditUserPage> {
                   keyboardType:
                       const TextInputType.numberWithOptions(decimal: true),
                   decoration:
-                      _salesFieldDecoration('Amount Limit per day (0 = none)'),
+                      _salesFieldDecoration('Amount Limit per day'),
                 ),
                 const SizedBox(height: 10),
                 TextField(
                   controller: d3Ctrl,
                   keyboardType: TextInputType.number,
                   decoration: _salesFieldDecoration(
-                      '3 Digit Count Limit (0 = none)'),
+                      '3 Digit Count Limit'),
                 ),
                 const SizedBox(height: 10),
                 TextField(
                   controller: d2Ctrl,
                   keyboardType: TextInputType.number,
                   decoration: _salesFieldDecoration(
-                      '2 Digit Count Limit (0 = none)'),
+                      '2 Digit Count Limit'),
                 ),
                 const SizedBox(height: 10),
                 TextField(
                   controller: d1Ctrl,
                   keyboardType: TextInputType.number,
                   decoration: _salesFieldDecoration(
-                      '1 Digit Count Limit (0 = none)'),
+                      '1 Digit Count Limit'),
                 ),
               ],
               if (!_isSelf) ...[
@@ -4637,10 +5107,6 @@ class _EditUserPageState extends State<EditUserPage> {
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('Login Block'),
-                  subtitle: Text(
-                    'User cannot sign in',
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-                  ),
                   value: nextLoginBlocked,
                   activeThumbColor: Colors.red.shade700,
                   onChanged: (v) => setState(() => nextLoginBlocked = v),
@@ -4648,10 +5114,6 @@ class _EditUserPageState extends State<EditUserPage> {
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('Sales Block'),
-                  subtitle: Text(
-                    'User cannot book / sell tickets',
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-                  ),
                   value: nextSalesBlocked,
                   activeThumbColor: Colors.orange.shade800,
                   onChanged: (v) => setState(() => nextSalesBlocked = v),
@@ -4723,7 +5185,7 @@ class _DigitCountLimitsPageState extends State<DigitCountLimitsPage> {
     await DigitLimitStore.update(next);
     await SyncService.queueDigitCountLimits(next.toJson());
     if (!mounted) return;
-    showSuccessSnack(context, 'Digit count limits saved');
+    showSuccessSnack(context, AppMsg.digitLimitsSaved);
   }
 
   @override
@@ -4737,55 +5199,25 @@ class _DigitCountLimitsPageState extends State<DigitCountLimitsPage> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: _appGradient.first.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: _appGradient.first.withValues(alpha: 0.15),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.info_outline,
-                        size: 18, color: _appGradient.first),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Global max count per bill (0 = unlimited). '
-                        'Agent-specific limits in Manage Users override these.',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
-                          color: Colors.grey.shade800,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 14),
               TextField(
                 controller: _d3Ctrl,
                 keyboardType: TextInputType.number,
                 decoration:
-                    _salesFieldDecoration('3 Digit Number Count (0 = none)'),
+                    _salesFieldDecoration('3 Digit Number Count'),
               ),
               const SizedBox(height: 10),
               TextField(
                 controller: _d2Ctrl,
                 keyboardType: TextInputType.number,
                 decoration:
-                    _salesFieldDecoration('2 Digit Number Count (0 = none)'),
+                    _salesFieldDecoration('2 Digit Number Count'),
               ),
               const SizedBox(height: 10),
               TextField(
                 controller: _d1Ctrl,
                 keyboardType: TextInputType.number,
                 decoration:
-                    _salesFieldDecoration('1 Digit Number Count (0 = none)'),
+                    _salesFieldDecoration('1 Digit Number Count'),
               ),
               const SizedBox(height: 18),
               _appGradientButton(
@@ -4836,6 +5268,123 @@ class _DrawSchedulePageState extends State<DrawSchedulePage> {
 
   Color _drawColor(String name) => _drawColorForTime(name);
 
+  Widget _drawFlatTimeBtn({
+    required String label,
+    required VoidCallback onPressed,
+    required Color color,
+    bool showLeftDivider = false,
+  }) {
+    return Expanded(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.08),
+          border: Border(
+            top: BorderSide(color: Colors.grey.shade300),
+            left: showLeftDivider
+                ? BorderSide(color: Colors.grey.shade300)
+                : BorderSide.none,
+          ),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onPressed,
+            child: SizedBox(
+              height: 40,
+              child: Center(
+                child: Text(
+                  label,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: color,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _drawTimingRow({
+    required String name,
+    required DrawSchedule schedule,
+    required bool openNow,
+  }) {
+    final color = _drawColor(name);
+    final openText =
+        formatDrawScheduleTime(schedule.openHour, schedule.openMinute);
+    final closeText =
+        formatDrawScheduleTime(schedule.closeHour, schedule.closeMinute);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.zero,
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+            child: Row(
+              children: [
+                Container(
+                  width: 4,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: color,
+                    borderRadius: BorderRadius.zero,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    name,
+                    style: const TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                Text(
+                  openNow ? 'OPEN' : 'CLOSED',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: openNow
+                        ? const Color(0xFF007E33)
+                        : const Color(0xFFCC0000),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Row(
+            children: [
+              _drawFlatTimeBtn(
+                label: 'Open $openText',
+                onPressed: () => _pickTime(schedule: schedule, isOpen: true),
+                color: const Color(0xFF007E33),
+              ),
+              _drawFlatTimeBtn(
+                label: 'Close $closeText',
+                onPressed: () => _pickTime(schedule: schedule, isOpen: false),
+                color: const Color(0xFFCC0000),
+                showLeftDivider: true,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return ValueListenableBuilder<Map<String, DrawSchedule>>(
@@ -4844,133 +5393,21 @@ class _DrawSchedulePageState extends State<DrawSchedulePage> {
         return _reportPage(
           context: context,
           title: 'Draw Timings',
-          body: ListView(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
-            children: [
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: _appGradient.first.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: _appGradient.first.withValues(alpha: 0.15),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.info_outline,
-                        size: 18, color: _appGradient.first),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Set open & close time for each draw. Booking allowed only within this window.',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
-                          color: Colors.grey.shade800,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              ...kDrawTimeNames.map((name) {
-                final s = map[name] ?? DrawScheduleStore.scheduleFor(name);
-                final color = _drawColor(name);
-                final openNow =
-                    DrawScheduleStore.isDrawBookingOpen(name, at: DateTime.now());
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Container(
-                              width: 10,
-                              height: 10,
-                              decoration: BoxDecoration(
-                                color: color,
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                name,
-                                style: const TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: openNow
-                                    ? Colors.green.shade50
-                                    : Colors.red.shade50,
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Text(
-                                openNow ? 'OPEN' : 'CLOSED',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w700,
-                                  color: openNow
-                                      ? Colors.green.shade700
-                                      : Colors.red.shade700,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: OutlinedButton.icon(
-                                onPressed: () => _pickTime(
-                                  schedule: s,
-                                  isOpen: true,
-                                ),
-                                icon: const Icon(Icons.login, size: 18),
-                                label: Text(
-                                  'Open: ${formatDrawScheduleTime(s.openHour, s.openMinute)}',
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: OutlinedButton.icon(
-                                onPressed: () => _pickTime(
-                                  schedule: s,
-                                  isOpen: false,
-                                ),
-                                icon: const Icon(Icons.logout, size: 18),
-                                label: Text(
-                                  'Close: ${formatDrawScheduleTime(s.closeHour, s.closeMinute)}',
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              }),
-            ],
+          body: ListView.separated(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 16),
+            itemCount: kDrawTimeNames.length,
+            separatorBuilder: (_, __) => const SizedBox(height: 8),
+            itemBuilder: (context, index) {
+              final name = kDrawTimeNames[index];
+              final s = map[name] ?? DrawScheduleStore.scheduleFor(name);
+              final openNow =
+                  DrawScheduleStore.isDrawBookingOpen(name, at: DateTime.now());
+              return _drawTimingRow(
+                name: name,
+                schedule: s,
+                openNow: openNow,
+              );
+            },
           ),
         );
       },
@@ -5056,21 +5493,21 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
   }
 
   Future<void> _confirmDelete(AppUser user) async {
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: const Text("Delete user?"),
-          content: Text("Delete ${user.username}? This cannot be undone."),
+          title: Text(AppMsg.deleteUserTitle),
+          content: Text(AppMsg.deleteUserBody(user.username)),
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(context, false),
-                child: const Text("Cancel")),
+                child: Text(AppMsg.cancel)),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.red, foregroundColor: Colors.white),
               onPressed: () => Navigator.pop(context, true),
-              child: const Text("Delete"),
+              child: Text(AppMsg.delete),
             ),
           ],
         );
@@ -5082,9 +5519,7 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
     if (!mounted) return;
     showAppSnack(
       context,
-      deleted
-          ? 'User deleted'
-          : "Failed: can't delete yourself, can't delete last ADMIN, or user missing",
+      deleted ? AppMsg.userDeleted : AppMsg.userDeleteFailed,
       success: deleted,
     );
   }
@@ -5103,76 +5538,137 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
   }
 
   Widget _buildTabSwitcher() {
-    return Row(
-      children: [
-        Expanded(
-          child: _tabCard(
-            index: 0,
-            emoji: '📋',
-            label: 'List Users',
-          ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: _tabCard(
-            index: 1,
-            emoji: '➕',
-            label: 'Create User',
-          ),
-        ),
-      ],
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.zero,
+      ),
+      child: Row(
+        children: [
+          Expanded(child: _flatTabButton(index: 0, label: 'List Users')),
+          Container(width: 1, height: 36, color: Colors.grey.shade300),
+          Expanded(child: _flatTabButton(index: 1, label: 'Create User')),
+        ],
+      ),
     );
   }
 
-  Widget _tabCard({
-    required int index,
-    required String emoji,
-    required String label,
-  }) {
+  Widget _flatTabButton({required int index, required String label}) {
     final selected = _tabIndex == index;
     return Material(
-      color: Colors.transparent,
+      color: selected ? kAppBlue.withValues(alpha: 0.1) : Colors.transparent,
       child: InkWell(
         onTap: () => setState(() => _tabIndex = index),
-        borderRadius: BorderRadius.circular(14),
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 10),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: selected ? _appGradient.first : Colors.grey.shade300,
-              width: selected ? 2 : 1,
-            ),
-            boxShadow: selected
-                ? [
-                    BoxShadow(
-                      color: _appGradient.first.withValues(alpha: 0.18),
-                      blurRadius: 10,
-                      offset: const Offset(0, 4),
-                    ),
-                  ]
-                : [],
-          ),
-          child: Column(
-            children: [
-              Text(emoji, style: const TextStyle(fontSize: 30)),
-              const SizedBox(height: 8),
-              Text(
-                label,
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontWeight: FontWeight.w700,
-                  fontSize: 14,
-                  color: selected ? _appGradient.first : Colors.grey.shade800,
-                ),
+        child: SizedBox(
+          height: 40,
+          child: Center(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: selected ? kAppBlue : Colors.grey.shade700,
               ),
-            ],
+            ),
           ),
         ),
       ),
     );
+  }
+
+  Widget _userTag(String label, Color color) {
+    return Text(
+      label,
+      style: TextStyle(
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+        color: color,
+      ),
+    );
+  }
+
+  Widget _userFlatAction({
+    required String label,
+    required VoidCallback onPressed,
+    required Color color,
+    bool showLeftDivider = false,
+  }) {
+    return Expanded(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.08),
+          border: Border(
+            top: BorderSide(color: Colors.grey.shade300),
+            left: showLeftDivider
+                ? BorderSide(color: Colors.grey.shade300)
+                : BorderSide.none,
+          ),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onPressed,
+            child: SizedBox(
+              height: 38,
+              child: Center(
+                child: Text(
+                  label,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: color,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _userActionBar(AppUser u, bool isSelf) {
+    final actions = <Widget>[
+      _userFlatAction(
+        label: 'Edit',
+        onPressed: () => _openEditUser(u),
+        color: kAppBlue,
+      ),
+    ];
+    if (!isSelf) {
+      actions.addAll([
+        _userFlatAction(
+          label: u.isBlocked ? 'Login On' : 'Login Off',
+          onPressed: () {
+            UserStore.toggleLoginBlock(u.username);
+            setState(() {});
+          },
+          color: u.isBlocked ? const Color(0xFF007E33) : const Color(0xFFCC0000),
+          showLeftDivider: true,
+        ),
+        _userFlatAction(
+          label: u.isSalesBlocked ? 'Sales On' : 'Sales Off',
+          onPressed: () {
+            UserStore.toggleSalesBlock(u.username);
+            setState(() {});
+          },
+          color: u.isSalesBlocked
+              ? const Color(0xFF007E33)
+              : const Color(0xFFFF8800),
+          showLeftDivider: true,
+        ),
+        _userFlatAction(
+          label: 'Delete',
+          onPressed: () => _confirmDelete(u),
+          color: const Color(0xFFCC0000),
+          showLeftDivider: true,
+        ),
+      ]);
+    }
+    return Row(children: actions);
   }
 
   Widget _buildListUsersTab(List<AppUser> users) {
@@ -5185,25 +5681,11 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-          child: Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.grey.shade300),
-            ),
-            child: Row(
-              children: [
-                _usersStatChip('Total', '${users.length}'),
-                const SizedBox(width: 8),
-                _usersStatChip('Login OK', '$active'),
-                const SizedBox(width: 8),
-                _usersStatChip('Login Block', '$loginBlockedCount'),
-                const SizedBox(width: 8),
-                _usersStatChip('Sales Block', '$salesBlockedCount'),
-              ],
-            ),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+          child: Text(
+            'Total ${users.length}  ·  OK $active  ·  '
+            'Login block $loginBlockedCount  ·  Sales block $salesBlockedCount',
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
           ),
         ),
         Padding(
@@ -5211,32 +5693,19 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
           child: TextField(
             controller: searchController,
             onChanged: (_) => setState(() {}),
-            decoration: InputDecoration(
-              hintText: 'Search by username, role, scheme...',
-              prefixIcon: const Icon(Icons.search, size: 22),
+            decoration: _salesFieldDecoration('Search username, role, scheme').copyWith(
+              prefixIcon: const Icon(Icons.search, size: 20),
               suffixIcon: searchController.text.isNotEmpty
                   ? IconButton(
-                      icon: const Icon(Icons.clear, size: 20),
+                      icon: const Icon(Icons.clear, size: 18),
                       onPressed: _clearSearch,
                     )
                   : null,
-              filled: true,
-              fillColor: Colors.white,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide(color: Colors.grey.shade300),
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide(color: Colors.grey.shade300),
-              ),
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
             ),
           ),
         ),
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
           child: Row(
             children: [
               Expanded(
@@ -5244,7 +5713,7 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
                   '${filtered.length} user${filtered.length == 1 ? '' : 's'}',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
-                    fontSize: 13,
+                    fontSize: 12,
                     color: Colors.grey.shade600,
                   ),
                 ),
@@ -5255,14 +5724,19 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
                   height: 16,
                   child: CircularProgressIndicator(
                     strokeWidth: 2,
-                    color: _appGradient.first,
+                    color: kAppBlue,
                   ),
                 )
               else
-                IconButton(
-                  icon: const Icon(Icons.refresh, size: 20),
-                  tooltip: 'Refresh users',
+                TextButton(
                   onPressed: _refreshUserList,
+                  style: TextButton.styleFrom(
+                    foregroundColor: kAppBlue,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 32),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: const Text('Refresh'),
                 ),
             ],
           ),
@@ -5276,14 +5750,14 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Icon(Icons.people_outline,
-                            size: 48, color: Colors.grey.shade400),
-                        const SizedBox(height: 12),
+                            size: 40, color: Colors.grey.shade400),
+                        const SizedBox(height: 10),
                         Text(
                           searchController.text.isEmpty
                               ? 'No users yet'
                               : 'No users match your search',
                           style: TextStyle(
-                            fontSize: 15,
+                            fontSize: 14,
                             color: Colors.grey.shade600,
                           ),
                         ),
@@ -5291,10 +5765,11 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
                     ),
                   ),
                 )
-              : ListView.builder(
+              : ListView.separated(
                   controller: _listScrollController,
-                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 16),
+                  padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
                   itemCount: filtered.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 8),
                   itemBuilder: (context, index) => _userCard(filtered[index]),
                 ),
         ),
@@ -5305,162 +5780,143 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
   Widget _buildCreateUserTab() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
-      child: _reportFormCard(
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        _appGradient.first.withValues(alpha: 0.85),
-                        _appGradient.last,
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Icon(
-                    Icons.person_add_alt_1_outlined,
-                    color: Colors.white,
-                    size: 20,
-                  ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          TextField(
+            controller: usernameController,
+            decoration: _salesFieldDecoration('Username'),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: passwordController,
+            obscureText: true,
+            decoration: _salesFieldDecoration('Password'),
+          ),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(
+            key: ValueKey(role),
+            initialValue: role,
+            decoration: _salesFieldDecoration('User Type'),
+            items: const [
+              DropdownMenuItem(value: 'AGENT', child: Text('Agent')),
+              DropdownMenuItem(value: 'SUBAGENT', child: Text('Sub Agent')),
+            ],
+            onChanged: (v) => setState(() => role = v ?? 'AGENT'),
+          ),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(
+            key: ValueKey(scheme),
+            initialValue: scheme,
+            decoration: _salesFieldDecoration('Scheme'),
+            items: _schemeOptions
+                .map((s) => DropdownMenuItem(value: s, child: Text(s)))
+                .toList(),
+            onChanged: (v) => setState(() => scheme = v ?? 'ALL'),
+          ),
+          const SizedBox(height: 10),
+          ValueListenableBuilder<List<RateSet>>(
+            valueListenable: RateSetStore.sets,
+            builder: (context, rateSets, _) {
+              final selected = rateSets.any((r) => r.id == rateSetId)
+                  ? rateSetId
+                  : (rateSets.isNotEmpty ? rateSets.first.id : 'standard');
+              return DropdownButtonFormField<String>(
+                key: ValueKey(selected),
+                initialValue: selected,
+                decoration: _salesFieldDecoration('Price List / Rate Set'),
+                items: rateSets
+                    .map(
+                      (r) => DropdownMenuItem(
+                        value: r.id,
+                        child: Text(r.name),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (v) => setState(() => rateSetId = v ?? rateSetId),
+              );
+            },
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: amountLimitController,
+            keyboardType:
+                const TextInputType.numberWithOptions(decimal: true),
+            decoration: _salesFieldDecoration('Amount Limit per day'),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: digit3LimitController,
+                  keyboardType: TextInputType.number,
+                  decoration: _salesFieldDecoration('3 Digit Limit'),
                 ),
-                const SizedBox(width: 10),
-                const Expanded(
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: digit2LimitController,
+                  keyboardType: TextInputType.number,
+                  decoration: _salesFieldDecoration('2 Digit Limit'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: TextField(
+                  controller: digit1LimitController,
+                  keyboardType: TextInputType.number,
+                  decoration: _salesFieldDecoration('1 Digit Limit'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Login Block'),
+            value: loginBlocked,
+            activeThumbColor: Colors.red.shade700,
+            onChanged: (v) => setState(() => loginBlocked = v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Sales Block'),
+            value: salesBlocked,
+            activeThumbColor: Colors.orange.shade800,
+            onChanged: (v) => setState(() => salesBlocked = v),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 42,
+            child: Material(
+              color: kAppBlue,
+              borderRadius: BorderRadius.zero,
+              child: InkWell(
+                onTap: _submitCreateUser,
+                borderRadius: BorderRadius.zero,
+                child: const Center(
                   child: Text(
-                    'New User',
+                    'Create User',
                     style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 17,
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
                     ),
                   ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: usernameController,
-              decoration: _salesFieldDecoration('Username'),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: passwordController,
-              obscureText: true,
-              decoration: _salesFieldDecoration('Password'),
-            ),
-            const SizedBox(height: 10),
-            DropdownButtonFormField<String>(
-              key: ValueKey(role),
-              initialValue: role,
-              decoration: _salesFieldDecoration('User Type'),
-              items: const [
-                DropdownMenuItem(value: 'AGENT', child: Text('Agent')),
-                DropdownMenuItem(value: 'SUBAGENT', child: Text('Sub Agent')),
-              ],
-              onChanged: (v) => setState(() => role = v ?? 'AGENT'),
-            ),
-            const SizedBox(height: 10),
-            DropdownButtonFormField<String>(
-              key: ValueKey(scheme),
-              initialValue: scheme,
-              decoration: _salesFieldDecoration('Scheme'),
-              items: _schemeOptions
-                  .map((s) => DropdownMenuItem(value: s, child: Text(s)))
-                  .toList(),
-              onChanged: (v) => setState(() => scheme = v ?? 'ALL'),
-            ),
-            const SizedBox(height: 10),
-            ValueListenableBuilder<List<RateSet>>(
-              valueListenable: RateSetStore.sets,
-              builder: (context, rateSets, _) {
-                final selected = rateSets.any((r) => r.id == rateSetId)
-                    ? rateSetId
-                    : (rateSets.isNotEmpty ? rateSets.first.id : 'standard');
-                return DropdownButtonFormField<String>(
-                  key: ValueKey(selected),
-                  initialValue: selected,
-                  decoration: _salesFieldDecoration('Price List / Rate Set'),
-                  items: rateSets
-                      .map(
-                        (r) => DropdownMenuItem(
-                          value: r.id,
-                          child: Text(r.name),
-                        ),
-                      )
-                      .toList(),
-                  onChanged: (v) => setState(() => rateSetId = v ?? rateSetId),
-                );
-              },
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: amountLimitController,
-              keyboardType:
-                  const TextInputType.numberWithOptions(decimal: true),
-              decoration: _salesFieldDecoration(
-                  'Amount Limit per day (0 = none)'),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: digit3LimitController,
-              keyboardType: TextInputType.number,
-              decoration: _salesFieldDecoration(
-                  '3 Digit Count Limit per day (0 = none)'),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: digit2LimitController,
-              keyboardType: TextInputType.number,
-              decoration: _salesFieldDecoration(
-                  '2 Digit Count Limit per day (0 = none)'),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: digit1LimitController,
-              keyboardType: TextInputType.number,
-              decoration: _salesFieldDecoration(
-                  '1 Digit Count Limit per day (0 = none)'),
-            ),
-            const SizedBox(height: 10),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Login Block'),
-              subtitle: const Text(
-                'User cannot sign in',
-                style: TextStyle(fontSize: 12),
               ),
-              value: loginBlocked,
-              activeThumbColor: Colors.red.shade700,
-              onChanged: (v) => setState(() => loginBlocked = v),
             ),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Sales Block'),
-              subtitle: const Text(
-                'User cannot book / sell tickets',
-                style: TextStyle(fontSize: 12),
-              ),
-              value: salesBlocked,
-              activeThumbColor: Colors.orange.shade800,
-              onChanged: (v) => setState(() => salesBlocked = v),
-            ),
-            const SizedBox(height: 18),
-            _appGradientButton(
-              onPressed: _submitCreateUser,
-              child: const Text('Create User'),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 
   Future<void> _submitCreateUser() async {
     if (rateSetId.trim().isEmpty) {
-      showErrorSnack(context, 'Please select a Price List / Rate Set');
+      showErrorSnack(context, AppMsg.selectRateSet);
       return;
     }
     final ok = UserStore.addUser(
@@ -5480,7 +5936,7 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
       if (!mounted) return;
       showErrorSnack(
         context,
-        'Failed: check duplicate/empty fields or permissions',
+        AppMsg.createUserFailed,
       );
       return;
     }
@@ -5514,8 +5970,8 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
     showSuccessSnack(
       context,
       createdName.isEmpty
-          ? 'User created successfully'
-          : '$createdName created — now in List Users',
+          ? AppMsg.userCreated
+          : AppMsg.userCreatedNamed(createdName),
     );
   }
 
@@ -5530,10 +5986,7 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-                child: _buildTabSwitcher(),
-              ),
+              _buildTabSwitcher(),
               Expanded(
                 child: _tabIndex == 0
                     ? _buildListUsersTab(users)
@@ -5546,48 +5999,12 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
     );
   }
 
-  Widget _usersStatChip(String label, String value) {
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: [
-              _appGradient.first.withValues(alpha: 0.12),
-              Colors.white,
-            ],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: _appGradient.first.withValues(alpha: 0.12)),
-        ),
-        child: Column(
-          children: [
-            Text(
-              label,
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              value,
-              style: const TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Color _roleColor(String role) {
     switch (role.toUpperCase()) {
       case "ADMIN":
-        return _appGradient.first;
+        return kAppBlue;
       case "AGENT":
-        return const Color(0xFF1565C0);
+        return const Color(0xFF0099CC);
       case "SUBAGENT":
         return const Color(0xFF6A1B9A);
       case "CUSTOMER":
@@ -5612,298 +6029,95 @@ class _ManageUsersPageState extends State<ManageUsersPage> {
     final isSelf = u.username.trim().toLowerCase() ==
         AppSession.username.trim().toLowerCase();
     final roleColor = _roleColor(u.role);
-    final bg = roleColor.withValues(alpha: 0.08);
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: u.isBlocked
-              ? Colors.red.shade200
-              : u.isSalesBlocked
-                  ? Colors.orange.shade200
-                  : Colors.grey.shade300,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.04),
-            blurRadius: 6,
-            offset: const Offset(0, 2),
-          ),
-        ],
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.zero,
       ),
+      clipBehavior: Clip.antiAlias,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Container(
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-            decoration: BoxDecoration(
-              color: u.isBlocked
-                  ? Colors.red.shade50
-                  : u.isSalesBlocked
-                      ? Colors.orange.shade50
-                      : bg,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(12),
-              ),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: u.isBlocked
-                          ? [Colors.red.shade300, Colors.red.shade600]
-                          : u.isSalesBlocked
-                              ? [Colors.orange.shade300, Colors.orange.shade700]
-                              : [roleColor, roleColor.withValues(alpha: 0.75)],
-                    ),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Icon(
-                    u.isBlocked
-                        ? Icons.block
-                        : u.isSalesBlocked
-                            ? Icons.point_of_sale_outlined
-                            : Icons.person_outline,
-                    color: Colors.white,
-                    size: 20,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Flexible(
-                            child: Text(
-                              u.username,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 15,
-                              ),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          if (isSelf) ...[
-                            const SizedBox(width: 6),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 6, vertical: 2),
-                              decoration: BoxDecoration(
-                                color:
-                                    _appGradient.first.withValues(alpha: 0.15),
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                'You',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w600,
-                                  color: _appGradient.last,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 4,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 8, vertical: 3),
-                            decoration: BoxDecoration(
-                              color: roleColor.withValues(alpha: 0.15),
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: Text(
-                              _roleLabel(u.role),
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: roleColor,
-                              ),
-                            ),
-                          ),
-                          if (u.isBlocked)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: Colors.red.shade100,
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(
-                                'Login Block',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.red.shade700,
-                                ),
-                              ),
-                            ),
-                          if (u.isSalesBlocked)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: Colors.orange.shade100,
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(
-                                'Sales Block',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.orange.shade800,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                      if (u.isAgentRole) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          'Scheme: ${u.scheme} · ${RateSetStore.displayName(u.rateSetId)}',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Colors.grey.shade600,
-                          ),
-                        ),
-                      ],
-                      if (u.role != 'ADMIN' &&
-                          (u.amountLimit > 0 ||
-                              u.digit1CountLimit > 0 ||
-                              u.digit2CountLimit > 0 ||
-                              u.digit3CountLimit > 0)) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          [
-                            if (u.amountLimit > 0)
-                              'Amt ≤ ${u.amountLimit.toStringAsFixed(0)}',
-                            if (u.digit1CountLimit > 0) '1D ≤ ${u.digit1CountLimit}',
-                            if (u.digit2CountLimit > 0) '2D ≤ ${u.digit2CountLimit}',
-                            if (u.digit3CountLimit > 0) '3D ≤ ${u.digit3CountLimit}',
-                          ].join(' · '),
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Colors.grey.shade600,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                OutlinedButton.icon(
-                  onPressed: () => _openEditUser(u),
-                  icon: const Icon(Icons.edit_outlined, size: 16),
-                  label: const Text('Edit', style: TextStyle(fontSize: 12)),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    foregroundColor: _appGradient.first,
-                    side: BorderSide(
-                        color: _appGradient.first.withValues(alpha: 0.4)),
-                  ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        u.username,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (isSelf)
+                      Text(
+                        'You',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: kAppBlue,
+                        ),
+                      ),
+                  ],
                 ),
-                if (!isSelf) ...[
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: () {
-                            UserStore.toggleLoginBlock(u.username);
-                            setState(() {});
-                          },
-                          icon: Icon(
-                            u.isBlocked
-                                ? Icons.lock_open_outlined
-                                : Icons.login_outlined,
-                            size: 16,
-                          ),
-                          label: Text(
-                            u.isBlocked ? 'Login On' : 'Login Off',
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                          style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                            foregroundColor: u.isBlocked
-                                ? Colors.green.shade700
-                                : Colors.red.shade700,
-                            side: BorderSide(
-                              color: u.isBlocked
-                                  ? Colors.green.shade300
-                                  : Colors.red.shade300,
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: () {
-                            UserStore.toggleSalesBlock(u.username);
-                            setState(() {});
-                          },
-                          icon: Icon(
-                            u.isSalesBlocked
-                                ? Icons.shopping_cart_outlined
-                                : Icons.remove_shopping_cart_outlined,
-                            size: 16,
-                          ),
-                          label: Text(
-                            u.isSalesBlocked ? 'Sales On' : 'Sales Off',
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                          style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                            foregroundColor: u.isSalesBlocked
-                                ? Colors.green.shade700
-                                : Colors.orange.shade800,
-                            side: BorderSide(
-                              color: u.isSalesBlocked
-                                  ? Colors.green.shade300
-                                  : Colors.orange.shade300,
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: () => _confirmDelete(u),
-                          icon: const Icon(Icons.delete_outline, size: 16),
-                          label: const Text('Delete',
-                              style: TextStyle(fontSize: 11)),
-                          style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                            foregroundColor: Colors.red.shade700,
-                            side: BorderSide(color: Colors.red.shade200),
-                          ),
-                        ),
-                      ),
-                    ],
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 2,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    _userTag(_roleLabel(u.role), roleColor),
+                    if (u.isBlocked)
+                      _userTag('Login Block', const Color(0xFFCC0000)),
+                    if (u.isSalesBlocked)
+                      _userTag('Sales Block', const Color(0xFFFF8800)),
+                  ],
+                ),
+                if (u.isAgentRole) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'Scheme: ${u.scheme} · ${RateSetStore.displayName(u.rateSetId)}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                ],
+                if (u.role != 'ADMIN' &&
+                    (u.amountLimit > 0 ||
+                        u.digit1CountLimit > 0 ||
+                        u.digit2CountLimit > 0 ||
+                        u.digit3CountLimit > 0)) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    [
+                      if (u.amountLimit > 0)
+                        'Amt ≤ ${u.amountLimit.toStringAsFixed(0)}',
+                      if (u.digit1CountLimit > 0)
+                        '1D ≤ ${u.digit1CountLimit}',
+                      if (u.digit2CountLimit > 0)
+                        '2D ≤ ${u.digit2CountLimit}',
+                      if (u.digit3CountLimit > 0)
+                        '3D ≤ ${u.digit3CountLimit}',
+                    ].join(' · '),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.grey.shade600,
+                    ),
                   ),
                 ],
               ],
             ),
           ),
+          _userActionBar(u, isSelf),
         ],
       ),
     );
@@ -5917,7 +6131,18 @@ class PriceListPage extends StatefulWidget {
   State<PriceListPage> createState() => _PriceListPageState();
 }
 
+class _PrizeCommissionRow {
+  final String prize;
+  final int rate;
+  final int dc;
+
+  const _PrizeCommissionRow(this.prize, this.rate, this.dc);
+}
+
 class _PriceListPageState extends State<PriceListPage> {
+  static const Color _tableHeaderBg = Color(0xFF8E8E8E);
+  static const Color _tableBorder = Color(0xFFD0D0D0);
+
   String _viewUsername = AppSession.username.isNotEmpty
       ? AppSession.username
       : 'admin';
@@ -5938,324 +6163,248 @@ class _PriceListPageState extends State<PriceListPage> {
     if (changed == true && mounted) setState(() {});
   }
 
-  Color _schemeTint(String name) {
-    final n = name.toUpperCase();
-    if (n.contains("SUPER")) return const Color(0xFF5E35B1);
-    if (n.contains("BOX")) return const Color(0xFF00897B);
-    if (n.contains("-AB") || n.contains("-BC") || n.contains("-AC")) {
-      return const Color(0xFF3949AB);
+  Map<String, dynamic>? _schemeBySuffix(String suffix) {
+    final target = 'DEAR1-${suffix.toUpperCase()}';
+    for (final s in _activeSchemes) {
+      if (s['name']?.toString().toUpperCase() == target) return s;
     }
-    return const Color(0xFFE65100);
+    return null;
+  }
+
+  int _displayDc(List<int> row, _WinningPrizeParts fallback) {
+    final superAmt = row.length > 3 ? row[3] : 0;
+    if (superAmt > 0) return superAmt;
+    return fallback.superAmount.toInt();
+  }
+
+  List<_PrizeCommissionRow> _commissionRows() {
+    const superLabels = [
+      'First',
+      'Second',
+      'Third',
+      'Fourt',
+      'Five',
+      'Guarantee (Six)',
+    ];
+    final out = <_PrizeCommissionRow>[];
+
+    final superScheme = _schemeBySuffix('SUPER');
+    if (superScheme != null) {
+      final rows = coercePrizeRows(superScheme['rows']);
+      for (var i = 0; i < rows.length && i < superLabels.length; i++) {
+        final row = rows[i];
+        final fallback = i < _kSuperRowFallbacks.length
+            ? _kSuperRowFallbacks[i]
+            : const _WinningPrizeParts(base: 0, superAmount: 0);
+        out.add(_PrizeCommissionRow(
+          superLabels[i],
+          row[2],
+          _displayDc(row, fallback),
+        ));
+      }
+    }
+
+    final boxScheme = _schemeBySuffix('BOX');
+    if (boxScheme != null) {
+      final rows = coercePrizeRows(boxScheme['rows']);
+      if (rows.isNotEmpty) {
+        out.add(_PrizeCommissionRow(
+          'Box First Price',
+          rows[0][2],
+          _displayDc(rows[0], _kBoxNormalDirectFallback),
+        ));
+      }
+      if (rows.length > 1) {
+        out.add(_PrizeCommissionRow(
+          'Box Series',
+          rows[1][2],
+          _displayDc(rows[1], _kBoxNormalIndirectFallback),
+        ));
+      }
+      if (rows.length > 6) {
+        out.add(_PrizeCommissionRow(
+          'Double Box First Price',
+          rows[6][2],
+          _displayDc(rows[6], _kBox2SameDirectFallback),
+        ));
+      }
+      if (rows.length > 7) {
+        out.add(_PrizeCommissionRow(
+          'Double Box Series',
+          rows[7][2],
+          _displayDc(rows[7], _kBox2SameIndirectFallback),
+        ));
+      }
+    }
+
+    final single = _schemeBySuffix('A');
+    if (single != null) {
+      final rows = coercePrizeRows(single['rows']);
+      if (rows.isNotEmpty) {
+        final row = rows.first;
+        out.add(_PrizeCommissionRow(
+          'Single(1)',
+          row[2],
+          _displayDc(row, _kAbcFallback),
+        ));
+      }
+    }
+
+    final dbl = _schemeBySuffix('AB');
+    if (dbl != null) {
+      final rows = coercePrizeRows(dbl['rows']);
+      if (rows.isNotEmpty) {
+        final row = rows.first;
+        out.add(_PrizeCommissionRow(
+          'Double(2)',
+          row[2],
+          _displayDc(row, _k2dFallback),
+        ));
+      }
+    }
+
+    return out;
   }
 
   @override
   Widget build(BuildContext context) {
-    final byGroup = <String, List<Map<String, dynamic>>>{};
-    for (final s in _activeSchemes) {
-      final g = s["group"]?.toString() ?? "Other";
-      byGroup.putIfAbsent(g, () => []).add(s);
-    }
-    for (final list in byGroup.values) {
-      _sortSchemesThreeTwoOne(list);
-    }
+    final rows = _commissionRows();
 
     return _reportPage(
       context: context,
-      title: 'Price List',
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
-        children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-              color: _appGradient.first.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(
-                color: _appGradient.first.withValues(alpha: 0.15),
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.all_inclusive, size: 18, color: _appGradient.first),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'All draws — DEAR1, LSK3, DEAR6, DEAR8 same prize table',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500,
-                      color: Colors.grey.shade800,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (AppSession.role == 'ADMIN') ...[
-            const SizedBox(height: 10),
-            ValueListenableBuilder<List<AppUser>>(
-              valueListenable: UserStore.users,
-              builder: (context, users, _) {
-                final names = users.map((u) => u.username).toList();
-                final selected = names.contains(_viewUsername)
-                    ? _viewUsername
-                    : (names.isNotEmpty ? names.first : 'admin');
-                return Row(
-                  children: [
-                    Expanded(
-                      child: DropdownButtonFormField<String>(
-                        key: ValueKey(selected),
-                        initialValue: selected,
-                        decoration: _salesFieldDecoration('User'),
-                        items: names
-                            .map((n) =>
-                                DropdownMenuItem(value: n, child: Text(n)))
-                            .toList(),
-                        onChanged: (v) {
-                          if (v == null) return;
-                          setState(() => _viewUsername = v);
-                        },
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      tooltip: 'Rate Master',
-                      onPressed: () {
-                        Navigator.push(
-                          context,
-                          appRoute(UserRateMasterPage(username: selected)),
-                        );
-                      },
-                      icon: Icon(Icons.tune, color: _appGradient.first),
-                    ),
-                    IconButton(
-                      tooltip: 'Edit prize table',
-                      onPressed: _openTableEditor,
-                      icon: Icon(Icons.table_chart_outlined,
-                          color: _appGradient.first),
-                    ),
-                  ],
-                );
-              },
-            ),
-          ],
-          const SizedBox(height: 12),
-          for (final group in _kPriceListGroupOrder)
-            if (byGroup[group] != null) ...[
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8, left: 2),
-                child: Text(
-                  _digitGroupDisplayLabel(group),
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.grey.shade600,
-                  ),
-                ),
-              ),
-              ...byGroup[group]!.map(_schemeCard),
-              const SizedBox(height: 8),
-            ],
-        ],
-      ),
-    );
-  }
-
-  Widget _schemeCard(Map<String, dynamic> scheme) {
-    final name = scheme["name"].toString();
-    final tint = _schemeTint(name);
-    final user = UserStore.byUsername(_viewUsername);
-    final displayRate = effectiveSaleRateForUser(
-      username: _viewUsername,
-      type: name,
-      role: user?.role ?? AppSession.role,
-      rateSetId: user?.rateSetId,
-    );
-    final List<List<int>> rows = coercePrizeRows(scheme["rows"]);
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
+      title: 'Prize And Commission',
+      body: ColoredBox(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 16),
+          children: [
+            if (AppSession.role == 'ADMIN') ...[
+              ValueListenableBuilder<List<AppUser>>(
+                valueListenable: UserStore.users,
+                builder: (context, users, _) {
+                  final names = users.map((u) => u.username).toList();
+                  final selected = names.contains(_viewUsername)
+                      ? _viewUsername
+                      : (names.isNotEmpty ? names.first : 'admin');
+                  return Row(
                     children: [
-                      Text(
-                        name,
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w600,
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          key: ValueKey(selected),
+                          initialValue: selected,
+                          decoration: _salesFieldDecoration('User'),
+                          items: names
+                              .map((n) => DropdownMenuItem(
+                                    value: n,
+                                    child: Text(n),
+                                  ))
+                              .toList(),
+                          onChanged: (v) {
+                            if (v == null) return;
+                            setState(() => _viewUsername = v);
+                          },
                         ),
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        scheme["group"].toString(),
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade500,
-                        ),
+                      const SizedBox(width: 4),
+                      IconButton(
+                        tooltip: 'Rate Master',
+                        onPressed: () {
+                          Navigator.push(
+                            context,
+                            appRoute(UserRateMasterPage(username: selected)),
+                          );
+                        },
+                        icon: Icon(Icons.tune, color: _appGradient.first),
+                      ),
+                      IconButton(
+                        tooltip: 'Edit prize table',
+                        onPressed: _openTableEditor,
+                        icon: Icon(Icons.table_chart_outlined,
+                            color: _appGradient.first),
                       ),
                     ],
-                  ),
-                ),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                  decoration: BoxDecoration(
-                    color: tint.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    'Rate ${displayRate.toStringAsFixed(2)}',
-                    style: TextStyle(
-                      color: tint,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 13,
-                    ),
-                  ),
-                ),
-                if (AppSession.role == 'ADMIN') ...[
-                  const SizedBox(width: 4),
-                  IconButton(
-                    tooltip: 'Edit prize table',
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(
-                      minWidth: 36,
-                      minHeight: 36,
-                    ),
-                    onPressed: () => _openTableEditor(schemeName: name),
-                    icon: Icon(Icons.edit_outlined, size: 20, color: tint),
-                  ),
-                ],
-              ],
+                  );
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+            _prizeCommissionTable(rows),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _prizeCommissionTable(List<_PrizeCommissionRow> rows) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: _tableBorder),
+      ),
+      child: Column(
+        children: [
+          _prizeCommissionTableRow('Prize', 'Rate', 'DC', header: true),
+          for (final row in rows)
+            _prizeCommissionTableRow(
+              row.prize,
+              '${row.rate}',
+              '${row.dc}',
             ),
-          ),
-          Divider(height: 1, color: Colors.grey.shade200),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 6, 8, 10),
-            child: _prizeTable(rows, tint, schemeName: name),
-          ),
         ],
       ),
     );
   }
 
-  Widget _prizeTable(
-    List<List<int>> rows,
-    Color accent, {
-    required String schemeName,
+  Widget _prizeCommissionTableRow(
+    String prize,
+    String rate,
+    String dc, {
+    bool header = false,
   }) {
-    final isSuper = schemeName.toUpperCase().contains('SUPER');
-    final isBox = schemeName.toUpperCase().contains('BOX');
-    final suffix = schemeSuffixFromName(schemeName);
-    final isOneDigit = _isOneDigitSchemeSuffix(suffix);
-    final isTwoDigit = _isTwoDigitSchemeSuffix(suffix);
-    return Column(
-      children: [
-        _prizeRow(
-          const ["Position", "Count", "Amount", "Super"],
-          accent: accent,
-          header: true,
-        ),
-        for (var i = 0; i < rows.length; i++)
-          _prizeRow(
-            [
-              rows[i][0].toString(),
-              rows[i][1].toString(),
-              rows[i][2].toString(),
-              rows[i][3].toString(),
-            ],
-            accent: accent,
-            header: false,
-            position: rows[i][0],
-            complimentsRow: isSuper && rows[i][0] == 6,
-            firstPrizeColorOnly: isBox || isOneDigit || isTwoDigit,
-            boxTwoSameDirect: isBox && i == 6,
-            boxTwoSameIndirect: isBox && i == 7,
-          ),
-      ],
+    final bg = header ? _tableHeaderBg : Colors.white;
+    final prizeStyle = TextStyle(
+      fontSize: 15,
+      fontWeight: FontWeight.w700,
+      color: header ? Colors.white : Colors.black,
     );
-  }
+    final valueStyle = TextStyle(
+      fontSize: 15,
+      fontWeight: header ? FontWeight.w700 : FontWeight.w400,
+      color: header ? Colors.white : Colors.black,
+    );
 
-  Widget _prizeRow(
-    List<String> cells, {
-    required Color accent,
-    required bool header,
-    int? position,
-    bool complimentsRow = false,
-    bool firstPrizeColorOnly = false,
-    bool boxTwoSameDirect = false,
-    bool boxTwoSameIndirect = false,
-  }) {
-    Color bg;
-    if (header) {
-      bg = _kComplimentsHeadingBg;
-    } else if (firstPrizeColorOnly) {
-      bg = _kResultPrizeColors[0];
-    } else if (position != null && position >= 1 && position <= 5) {
-      bg = _kResultPrizeColors[position - 1];
-    } else {
-      bg = Colors.white;
+    Widget cell(String text, TextStyle style, {TextAlign align = TextAlign.left}) {
+      return Container(
+        alignment: align == TextAlign.center
+            ? Alignment.center
+            : Alignment.centerLeft,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+        decoration: BoxDecoration(
+          color: bg,
+          border: Border(
+            bottom: BorderSide(color: _tableBorder),
+            right: BorderSide(color: _tableBorder),
+          ),
+        ),
+        child: Text(text, textAlign: align, style: style),
+      );
     }
 
-    final positionLabel = header
-        ? cells[0]
-        : _prizePositionDisplayLabel(
-            position: position,
-            compliments: complimentsRow,
-            boxScheme: firstPrizeColorOnly,
-            boxTwoSameDirect: boxTwoSameDirect,
-            boxTwoSameIndirect: boxTwoSameIndirect,
-          );
-
-    return Container(
-      color: bg,
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+    return IntrinsicHeight(
       child: Row(
-        children: List.generate(4, (i) {
-          final label = i == 0 ? positionLabel : cells[i];
-          final isComplimentsHeadingCell = complimentsRow && i == 0;
-          final isPrizeLabelCell = !header &&
-              i == 0 &&
-              !complimentsRow &&
-              (firstPrizeColorOnly ||
-                  (position != null && position >= 1 && position <= 5));
-          return Expanded(
-            child: Text(
-              label,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: header
-                    ? 11
-                    : (isComplimentsHeadingCell
-                        ? 11
-                        : (isPrizeLabelCell ? 10 : 14)),
-                fontWeight: header ||
-                        isComplimentsHeadingCell ||
-                        isPrizeLabelCell
-                    ? FontWeight.w600
-                    : FontWeight.w400,
-                letterSpacing:
-                    isComplimentsHeadingCell || isPrizeLabelCell ? 0.35 : 0,
-                color: header || isComplimentsHeadingCell
-                    ? _kComplimentsHeadingGrey
-                    : Colors.black87,
-              ),
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(flex: 5, child: cell(prize, prizeStyle)),
+          Expanded(flex: 3, child: cell(rate, valueStyle, align: TextAlign.center)),
+          Expanded(
+            flex: 2,
+            child: cell(
+              dc,
+              valueStyle,
+              align: TextAlign.center,
             ),
-          );
-        }),
+          ),
+        ],
       ),
     );
   }
@@ -6429,7 +6578,7 @@ class _PriceListTableEditorPageState extends State<PriceListTableEditorPage> {
     setState(() => _saving = false);
     showSuccessSnack(
       context,
-      'Prize table saved for all draws (DEAR1/LSK3/DEAR6/DEAR8)',
+      AppMsg.prizeTableSaved,
     );
     Navigator.pop(context, true);
   }
@@ -6457,7 +6606,7 @@ class _PriceListTableEditorPageState extends State<PriceListTableEditorPage> {
           horizontal: 6,
           vertical: compact ? 8 : 10,
         ),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+        border: OutlineInputBorder(borderRadius: BorderRadius.zero),
       ),
     );
   }
@@ -6471,7 +6620,7 @@ class _PriceListTableEditorPageState extends State<PriceListTableEditorPage> {
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.zero,
         border: Border.all(color: Colors.grey.shade200),
       ),
       child: Padding(
@@ -6595,23 +6744,6 @@ class _PriceListTableEditorPageState extends State<PriceListTableEditorPage> {
             widget.username,
             style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
           ),
-          const SizedBox(height: 4),
-          Text(
-            'Same table applies to DEAR1, LSK3, DEAR6 & DEAR8',
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-          ),
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: _appGradient.first.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Text(
-              'Position / Count / Amount / Super',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
-            ),
-          ),
           const SizedBox(height: 12),
           for (final index in _visibleIndices) _schemeEditor(index),
           const SizedBox(height: 8),
@@ -6695,7 +6827,7 @@ class _UserRateMasterPageState extends State<UserRateMasterPage> {
     setState(() => _saving = false);
     showSuccessSnack(
       context,
-      'Rates saved for all draws (DEAR1/LSK3/DEAR6/DEAR8)',
+      AppMsg.ratesSaved,
     );
     Navigator.pop(context, true);
   }
@@ -6726,40 +6858,6 @@ class _UserRateMasterPageState extends State<UserRateMasterPage> {
                   fontSize: 17,
                 ),
               ),
-              const SizedBox(height: 4),
-              Text(
-                '0 = use price list / default rate',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-              ),
-              const SizedBox(height: 8),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  color: _appGradient.first.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: _appGradient.first.withValues(alpha: 0.15),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.all_inclusive,
-                        size: 18, color: _appGradient.first),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Same 1D/2D/3D rates for DEAR1, LSK3, DEAR6, DEAR8',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
-                          color: Colors.grey.shade800,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
               const SizedBox(height: 10),
               OutlinedButton.icon(
                 onPressed: () {
@@ -6776,11 +6874,11 @@ class _UserRateMasterPageState extends State<UserRateMasterPage> {
                 label: const Text('Edit Prize Table (Amount / Super)'),
               ),
               const SizedBox(height: 14),
-              _rateField('SUPER/DC Rate (superDcRate)', 'superDcRate'),
+              _rateField('SUPER/DC Rate', 'superDcRate'),
               const SizedBox(height: 10),
-              _rateField('1D Rate — A/B/C (all draws)', 'rateD1'),
-              _rateField('2D Rate — AB/BC/AC (all draws)', 'rateD2'),
-              _rateField('3D Rate — SUPER/BOX/DC (all draws)', 'rateD3'),
+              _rateField('1D Rate — A/B/C', 'rateD1'),
+              _rateField('2D Rate — AB/BC/AC', 'rateD2'),
+              _rateField('3D Rate — SUPER/BOX/DC', 'rateD3'),
               const SizedBox(height: 10),
               DropdownButtonFormField<int>(
                 key: ValueKey(_rates.billingScheme),
@@ -7160,8 +7258,13 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
       compliments: compliments,
     ));
 
+    final code = widget.drawCode.trim().toUpperCase();
+    if (DearAutoResultService.isDearDraw(code)) {
+      unawaited(ResultStore.refreshDearDraw(code, widget.resultDate));
+    }
+
     if (!mounted) return;
-    showSuccessSnack(context, 'Manual saved (2nd–5th & compliments locked)');
+    showSuccessSnack(context, AppMsg.manualResultSaved);
     Navigator.pop(context, true);
   }
 
@@ -7169,27 +7272,29 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
     final code = widget.drawCode.trim().toUpperCase();
     final existing = ResultStore.get(code, widget.resultDate);
     if (existing == null) {
-      showErrorSnack(context, 'No saved result to delete');
+      showErrorSnack(context, AppMsg.noResultToDelete);
       return;
     }
 
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Delete result?'),
+        title: Text(AppMsg.deleteResultTitle),
         content: Text(
-          'Delete ${_drawDisplayTitle(widget.selectedDraw)} result for '
-          '${_dateLine()}? This cannot be undone.',
+          AppMsg.deleteResultBody(
+            _drawDisplayTitle(widget.selectedDraw),
+            _dateLine(),
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
+            child: Text(AppMsg.cancel),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Delete'),
+            child: Text(AppMsg.delete),
           ),
         ],
       ),
@@ -7198,32 +7303,20 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
 
     ResultStore.remove(code, widget.resultDate);
     if (!mounted) return;
-    showSuccessSnack(context, 'Result deleted');
+    showSuccessSnack(context, AppMsg.resultDeleted);
     Navigator.pop(context, true);
   }
 
   @override
   Widget build(BuildContext context) {
-    final themeColor = _drawThemeColor(widget.selectedDraw);
-    final themeGradient = _drawThemeGradient(widget.selectedDraw);
-
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        backgroundColor: themeGradient.first,
+        backgroundColor: kResultClassicHeaderBlue,
         foregroundColor: Colors.white,
         elevation: 0,
-        flexibleSpace: Container(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: themeGradient,
-              begin: Alignment.centerLeft,
-              end: Alignment.centerRight,
-            ),
-          ),
-        ),
         title: Text(
-          "Manual · ${_drawDisplayTitle(widget.selectedDraw)}",
+          "Manual · ${resultDrawSpacedTime(widget.selectedDraw)}",
           style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 17),
         ),
         actions: [
@@ -7254,7 +7347,7 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
               onPressed: _save,
               style: FilledButton.styleFrom(
                 backgroundColor: Colors.white,
-                foregroundColor: themeGradient.first,
+                foregroundColor: kResultClassicHeaderBlue,
               ),
               child: const Text("SAVE"),
             ),
@@ -7263,37 +7356,34 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
       ),
       body: ResultPageTemplateBackground(
         child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(15, 4, 15, 6),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(
-                height: 48,
-                child: ResultPageToolbar(
-                  dateLine: _dateLine(),
-                  accentColor: themeColor,
-                  showLiveButton: false,
-                  onChangeDate: () {},
-                ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
+              child: ResultWinningNumbersSearchRow(
+                timeLabel: resultDrawCompactTime(widget.selectedDraw),
+                dateLabel: resultDateFieldLabel(widget.resultDate),
               ),
-              Padding(
-                padding: const EdgeInsets.only(top: 4, bottom: 6),
-                child: Text(
-                  'Edit mode',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: themeColor,
-                  ),
-                ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              child: ValueListenableBuilder<String>(
+                valueListenable: BookingContactStore.whatsappPhone,
+                builder: (context, phone, _) {
+                  return ResultResultsTitleBar(
+                    bookingWhatsappPhone: _bookingWhatsappPhoneForViewer(phone),
+                  );
+                },
               ),
-              Expanded(
+            ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
                 child: LayoutBuilder(
                   builder: (context, inner) {
-                    const double gapLabel = 6;
-                    const double prizeFraction = 0.46;
+                    const double gapLabel = 4;
+                    const double prizeFraction = 0.37;
 
                     final double avail = inner.maxHeight - gapLabel;
                     final double prizeH =
@@ -7301,8 +7391,8 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
                     final double complimentsAreaH =
                         (avail - prizeH).clamp(0.0, double.infinity);
                     final double rowFontSize = complimentsAreaH > 0
-                        ? (complimentsAreaH / 10 * 0.45).clamp(9.0, 12.0)
-                        : 12.0;
+                        ? (complimentsAreaH / 10 * 0.52).clamp(10.0, 14.0)
+                        : 13.0;
 
                     return Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -7355,8 +7445,8 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
                   },
                 ),
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
       ),
@@ -7505,15 +7595,15 @@ class _DearResultPageState extends State<DearResultPage> {
       final code = _currentDrawCode();
       final after = ResultStore.signature(ResultStore.get(code, _resultDate));
       if (after.isEmpty) {
-        showErrorSnack(context, 'Result not published yet');
+        showErrorSnack(context, AppMsg.resultNotPublished);
       } else if (ResultStore.isComplete(ResultStore.get(code, _resultDate))) {
-        showSuccessSnack(context, 'Result updated');
+        showSuccessSnack(context, AppMsg.resultUpdated);
       } else {
-        showSuccessSnack(context, 'Partial result loaded');
+        showSuccessSnack(context, AppMsg.partialResultLoaded);
       }
     } catch (e) {
       if (userTriggered && mounted) {
-        showErrorSnack(context, 'Fetch failed: $e');
+        showErrorSnack(context, AppMsg.fetchFailed(e));
       }
     } finally {
       if (mounted) setState(() => _fetchingCloud = false);
@@ -7522,7 +7612,7 @@ class _DearResultPageState extends State<DearResultPage> {
 
   Future<void> _refreshActiveLiveDraws() async {
     if (!mounted) return;
-    final now = DateTime.now();
+    final now = DearAutoResultService.nowInIndia();
     final inLive = ResultFetchService.isAnyLiveWindowActive(now);
     final inFullPush = ResultFetchService.isAnyFullResultPushActive(now);
     final codes = (inLive || inFullPush)
@@ -7562,7 +7652,7 @@ class _DearResultPageState extends State<DearResultPage> {
     if (!mounted || _fetchingCloud) return;
     if (ApiService.token == null) {
       if (userTriggered && mounted) {
-        showErrorSnack(context, 'Not signed in');
+        showErrorSnack(context, AppMsg.notSignedIn);
       }
       return;
     }
@@ -7581,19 +7671,19 @@ class _DearResultPageState extends State<DearResultPage> {
       _loadSavedResult();
       if (!mounted || !userTriggered) return;
       if (after.isEmpty) {
-        showErrorSnack(context, 'Result not ready on server yet');
+        showErrorSnack(context, AppMsg.resultNotReadyOnServer);
       } else if (after != before) {
-        showSuccessSnack(context, 'Result updated from cloud');
+        showSuccessSnack(context, AppMsg.resultUpdatedFromCloud);
       } else if (ResultStore.isComplete(
         ResultStore.get(_currentDrawCode(), _resultDate),
       )) {
-        showSuccessSnack(context, 'Result already complete');
+        showSuccessSnack(context, AppMsg.resultAlreadyComplete);
       } else {
-        showSuccessSnack(context, 'Partial result loaded');
+        showSuccessSnack(context, AppMsg.partialResultLoaded);
       }
     } catch (e) {
       if (userTriggered && mounted) {
-        showErrorSnack(context, 'Fetch failed: $e');
+        showErrorSnack(context, AppMsg.fetchFailed(e));
       }
     } finally {
       if (mounted) setState(() => _fetchingCloud = false);
@@ -7699,19 +7789,19 @@ class _DearResultPageState extends State<DearResultPage> {
     final uri = LotteryLiveLinks.liveUriForDraw(code);
     final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!opened && mounted) {
-      showErrorSnack(context, 'Could not open live stream');
+      showErrorSnack(context, AppMsg.liveStreamOpenFailed);
     }
   }
 
   String _buildShareText() {
-    final draw = _drawDisplayTitle(_selectedDraw);
-    final date = _dateLine();
-    final buf = StringBuffer('$draw Result — $date\n\n');
+    final time = resultDrawSpacedTime(_selectedDraw);
+    final date = resultDateIso(_resultDate);
+    final buf = StringBuffer('Results $time-$date\n\n');
     for (var i = 0; i < 5; i++) {
       final label = i < kResultTemplatePrizeLabels.length
           ? kResultTemplatePrizeLabels[i]
-          : 'PRIZE ${i + 1}';
-      buf.writeln('$label: ${_prizeValues[i]}');
+          : 'Prize ${i + 1}';
+      buf.writeln('$label : ${_prizeValues[i]}');
     }
     final compliments = _complimentValues
         .where((c) => c.trim().isNotEmpty && c != '---')
@@ -7724,6 +7814,54 @@ class _DearResultPageState extends State<DearResultPage> {
     return buf.toString().trim();
   }
 
+  Future<void> _shareResultScreenshot({bool hd = false}) async {
+    final media = MediaQuery.of(context);
+    final cardWidth = media.size.width;
+    final cardHeight = media.size.height * 0.78;
+    final captureCard = ResultShareCaptureCard(
+      width: cardWidth,
+      height: cardHeight,
+      timeLabel: resultDrawCompactTime(_selectedDraw),
+      dateLabel: resultDateFieldLabel(_resultDate),
+      bookingWhatsappPhone: _bookingWhatsappPhoneForViewer(
+        BookingContactStore.whatsappPhone.value,
+      ),
+      prizes: List<String>.from(_prizeValues),
+      compliments: List<String>.from(_complimentValues),
+    );
+
+    final pixelRatio = hd
+        ? (media.devicePixelRatio < 3.0 ? 3.0 : media.devicePixelRatio)
+        : media.devicePixelRatio;
+
+    final image = await _shareCaptureController.captureFromLongWidget(
+      MediaQuery(
+        data: media.copyWith(textScaler: TextScaler.noScaling),
+        child: captureCard,
+      ),
+      context: context,
+      pixelRatio: pixelRatio,
+      delay: const Duration(milliseconds: 800),
+      constraints: BoxConstraints.tightFor(
+        width: cardWidth,
+        height: cardHeight,
+      ),
+    );
+    if (image.isEmpty) {
+      if (mounted) showErrorSnack(context, AppMsg.screenshotFailed);
+      return;
+    }
+    await Share.shareXFiles(
+      [
+        XFile.fromData(
+          image,
+          mimeType: 'image/png',
+          name: 'result_${_currentDrawCode()}_${_dateLine()}.png',
+        ),
+      ],
+    );
+  }
+
   Future<void> _shareResult() async {
     final choice = await showModalBottomSheet<String>(
       context: context,
@@ -7733,12 +7871,12 @@ class _DearResultPageState extends State<DearResultPage> {
           children: [
             ListTile(
               leading: const Icon(Icons.image_outlined),
-              title: const Text('Screenshot'),
+              title: Text(AppMsg.shareScreenshot),
               onTap: () => Navigator.pop(ctx, 'screenshot'),
             ),
             ListTile(
               leading: const Icon(Icons.message_outlined),
-              title: const Text('Text message'),
+              title: Text(AppMsg.shareText),
               onTap: () => Navigator.pop(ctx, 'text'),
             ),
           ],
@@ -7749,57 +7887,19 @@ class _DearResultPageState extends State<DearResultPage> {
 
     try {
       if (choice == 'screenshot') {
-        final media = MediaQuery.of(context);
-        final cardWidth = media.size.width;
-        final cardHeight = media.size.height * 0.78;
-        final captureCard = ResultShareCaptureCard(
-          width: cardWidth,
-          height: cardHeight,
-          drawTitle: _drawDisplayTitle(_selectedDraw),
-          dateLine: _dateLine(),
-          themeGradient: _drawThemeGradient(_selectedDraw),
-          prizes: List<String>.from(_prizeValues),
-          compliments: List<String>.from(_complimentValues),
-        );
-
-        final image = await _shareCaptureController.captureFromLongWidget(
-          MediaQuery(
-            data: media.copyWith(textScaler: TextScaler.noScaling),
-            child: captureCard,
-          ),
-          context: context,
-          pixelRatio: media.devicePixelRatio,
-          delay: const Duration(milliseconds: 800),
-          constraints: BoxConstraints.tightFor(
-            width: cardWidth,
-            height: cardHeight,
-          ),
-        );
-        if (image.isEmpty) {
-          if (mounted) showErrorSnack(context, 'Could not capture screenshot');
-          return;
-        }
-        await Share.shareXFiles(
-          [
-            XFile.fromData(
-              image,
-              mimeType: 'image/png',
-              name: 'result_${_currentDrawCode()}_${_dateLine()}.png',
-            ),
-          ],
-        );
+        await _shareResultScreenshot(hd: true);
         return;
       }
 
       final text = _buildShareText();
       if (text.isEmpty) {
-        if (mounted) showErrorSnack(context, 'No result to share');
+        if (mounted) showErrorSnack(context, AppMsg.noResultToShare);
         return;
       }
       await Share.share(text);
     } catch (e) {
       if (mounted) {
-        showErrorSnack(context, 'Share failed: $e');
+        showErrorSnack(context, AppMsg.shareFailed(e));
       }
     }
   }
@@ -7829,27 +7929,29 @@ class _DearResultPageState extends State<DearResultPage> {
     if (code.isEmpty) return;
     final existing = ResultStore.get(code, _resultDate);
     if (existing == null) {
-      showErrorSnack(context, 'No saved result to delete');
+      showErrorSnack(context, AppMsg.noResultToDelete);
       return;
     }
 
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Delete result?'),
+        title: Text(AppMsg.deleteResultTitle),
         content: Text(
-          'Delete ${_drawDisplayTitle(_selectedDraw)} result for '
-          '${_dateLine()}? This cannot be undone.',
+          AppMsg.deleteResultBody(
+            _drawDisplayTitle(_selectedDraw),
+            _dateLine(),
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
+            child: Text(AppMsg.cancel),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Delete'),
+            child: Text(AppMsg.delete),
           ),
         ],
       ),
@@ -7859,7 +7961,8 @@ class _DearResultPageState extends State<DearResultPage> {
     ResultStore.remove(code, _resultDate);
     _lastResultSignature = '';
     _clearResultUi();
-    showSuccessSnack(context, 'Result deleted');
+    _stopCloudPoll();
+    showSuccessSnack(context, AppMsg.resultDeleted);
   }
 
   @override
@@ -7888,141 +7991,172 @@ class _DearResultPageState extends State<DearResultPage> {
     if (mounted) setState(() {});
   }
 
+
+  Future<void> _shareViaWhatsApp() async {
+    final hasPrizes = _prizeValues.any((v) => v.trim().isNotEmpty && v != '---');
+    final hasCompliments = _complimentValues.any(
+      (c) => c.trim().isNotEmpty && c != '---',
+    );
+    if (!hasPrizes && !hasCompliments) {
+      if (mounted) showErrorSnack(context, AppMsg.noResultToShare);
+      return;
+    }
+    try {
+      await _shareResultScreenshot(hd: true);
+    } catch (e) {
+      if (mounted) showErrorSnack(context, AppMsg.shareFailed(e));
+    }
+  }
+
+  Future<void> _pickDraw() async {
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: _draws
+              .map(
+                (d) => ListTile(
+                  title: Text(d),
+                  onTap: () => Navigator.pop(ctx, d),
+                ),
+              )
+              .toList(),
+        ),
+      ),
+    );
+    if (picked == null || !mounted) return;
+    setState(() => _selectedDraw = picked);
+    _onDrawOrDateChanged();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final Color themeColor = _drawThemeColor(_selectedDraw);
-    final List<Color> themeGradient = _drawThemeGradient(_selectedDraw);
     final bool loading = SyncService.restoring.value;
     return Stack(
       children: [
         Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        backgroundColor: themeGradient.first,
+        backgroundColor: kResultClassicHeaderBlue,
         foregroundColor: Colors.white,
         elevation: 0,
-        systemOverlayStyle: SystemUiOverlayStyle(
-          statusBarColor: themeGradient.first,
+        systemOverlayStyle: const SystemUiOverlayStyle(
+          statusBarColor: kResultClassicHeaderBlue,
           statusBarIconBrightness: Brightness.light,
           statusBarBrightness: Brightness.dark,
-        ),
-        flexibleSpace: Container(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: themeGradient,
-              begin: Alignment.centerLeft,
-              end: Alignment.centerRight,
-            ),
-          ),
         ),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
           onPressed: () => Navigator.pop(context),
         ),
-        title: PopupMenuButton<String>(
-          offset: const Offset(0, kToolbarHeight * 0.9),
-          color: Colors.white,
-          onSelected: (v) {
-            setState(() => _selectedDraw = v);
-            _onDrawOrDateChanged();
-          },
-          itemBuilder: (context) => _draws
-              .map((d) => PopupMenuItem<String>(value: d, child: Text(d)))
-              .toList(),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Flexible(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    _drawDisplayTitle(_selectedDraw),
-                    maxLines: 1,
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 18,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-              ),
-              const Icon(Icons.arrow_drop_down, color: Colors.white),
-            ],
+        title: const Text(
+          'Winning Numbers',
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            fontSize: 18,
           ),
         ),
         centerTitle: true,
         actions: [
-          if (_canEditResult) ...[
-            TextButton(
-              onPressed: _openEditResultPage,
-              style: TextButton.styleFrom(foregroundColor: Colors.white),
-              child: const Text(
-                'MANUAL',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
-              ),
-            ),
-            if (ResultStore.get(_currentDrawCode(), _resultDate) != null)
-              TextButton(
-                onPressed: _confirmDeleteResult,
-                style: TextButton.styleFrom(foregroundColor: Colors.white70),
-                child: const Text(
-                  'DELETE',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+          if (_canEditResult)
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert, color: Colors.white),
+              onSelected: (value) {
+                switch (value) {
+                  case 'manual':
+                    _openEditResultPage();
+                    break;
+                  case 'delete':
+                    _confirmDeleteResult();
+                    break;
+                  case 'live':
+                    _openLiveYoutube();
+                    break;
+                  case 'share':
+                    _shareResult();
+                    break;
+                  case 'booking_phone':
+                    showBookingWhatsappPhoneEditor(context);
+                    break;
+                }
+              },
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  value: 'manual',
+                  child: Text(AppMsg.manualEntry),
                 ),
-              ),
-          ],
-          Padding(
-            padding: const EdgeInsets.only(right: 8, top: 8, bottom: 8),
-            child: OutlinedButton(
-              onPressed: _shareResult,
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.white,
-                side: const BorderSide(color: Colors.white),
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-              ),
-              child: const Text('SHARE'),
+                PopupMenuItem(
+                  value: 'booking_phone',
+                  child: const Text('Booking WhatsApp Phone'),
+                ),
+                if (ResultStore.get(_currentDrawCode(), _resultDate) != null)
+                  PopupMenuItem(
+                    value: 'delete',
+                    child: Text(AppMsg.deleteResultMenu),
+                  ),
+                PopupMenuItem(
+                  value: 'live',
+                  child: Text(AppMsg.liveStream),
+                ),
+                PopupMenuItem(
+                  value: 'share',
+                  child: Text(AppMsg.shareMenu),
+                ),
+              ],
             ),
-          ),
         ],
       ),
       body: ResultPageTemplateBackground(
         child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(
-                height: 44,
-                child: ResultPageToolbar(
-                  dateLine: _dateLine(),
-                  accentColor: themeColor,
-                  liveActive: ResultFetchService.isInLiveWindow(
-                    _currentDrawCode(),
-                    DateTime.now(),
-                  ),
-                  onLiveResult: _openLiveYoutube,
-                  onChangeDate: () async {
-                    final picked = await showDatePicker(
-                      context: context,
-                      initialDate: _resultDate,
-                      firstDate: DateTime(2020),
-                      lastDate: DateTime(2100),
-                    );
-                    if (picked != null && mounted) {
-                      setState(() => _resultDate = picked);
-                      _onDrawOrDateChanged();
-                    }
-                  },
-                ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
+              child: ResultWinningNumbersSearchRow(
+                timeLabel: resultDrawCompactTime(_selectedDraw),
+                dateLabel: resultDateFieldLabel(_resultDate),
+                onTimeTap: _pickDraw,
+                onDateTap: () async {
+                  final picked = await showDatePicker(
+                    context: context,
+                    initialDate: _resultDate,
+                    firstDate: DateTime(2020),
+                    lastDate: DateTime(2100),
+                  );
+                  if (picked != null && mounted) {
+                    setState(() => _resultDate = picked);
+                    _onDrawOrDateChanged();
+                  }
+                },
               ),
-              const SizedBox(height: 6),
-              Expanded(
+            ),
+            const SizedBox(height: 10),
+            Center(
+              child: ResultWinningNumbersSearchButton(
+                loading: _fetchingCloud,
+                onPressed: () =>
+                    _refreshCurrentDrawResult(userTriggered: true),
+              ),
+            ),
+            const SizedBox(height: 10),
+            ValueListenableBuilder<String>(
+              valueListenable: BookingContactStore.whatsappPhone,
+              builder: (context, phone, _) {
+                return ResultResultsTitleBar(
+                  bookingWhatsappPhone: _bookingWhatsappPhoneForViewer(phone),
+                );
+              },
+            ),
+            const SizedBox(height: 4),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
                 child: LayoutBuilder(
                   builder: (context, inner) {
                     const double gapLabel = 4;
-                    const double prizeFraction = 0.44;
+                    const double prizeFraction = 0.37;
 
                     final double avail = inner.maxHeight - gapLabel;
                     final double prizeH =
@@ -8030,8 +8164,8 @@ class _DearResultPageState extends State<DearResultPage> {
                     final double complimentsAreaH =
                         (avail - prizeH).clamp(0.0, double.infinity);
                     final double rowFontSize = complimentsAreaH > 0
-                        ? (complimentsAreaH / 10 * 0.42).clamp(8.0, 11.0)
-                        : 11.0;
+                        ? (complimentsAreaH / 10 * 0.52).clamp(10.0, 14.0)
+                        : 13.0;
 
                     return Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -8045,7 +8179,8 @@ class _DearResultPageState extends State<DearResultPage> {
                                 child: ResultTemplatePrizeBand(
                                   prizeIndex: i,
                                   value: _prizeValues[i],
-                                  numberFontSize: kResultTemplatePrizeFontSizes[i],
+                                  numberFontSize:
+                                      kResultTemplatePrizeFontSizes[i],
                                 ),
                               );
                             }),
@@ -8065,8 +8200,26 @@ class _DearResultPageState extends State<DearResultPage> {
                   },
                 ),
               ),
-            ],
-          ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(0, 4, 0, 10),
+              child: Center(
+                child: Material(
+                  color: const Color(0xFF25D366),
+                  shape: const CircleBorder(),
+                  elevation: 2,
+                  child: InkWell(
+                    customBorder: const CircleBorder(),
+                    onTap: _shareViaWhatsApp,
+                    child: const Padding(
+                      padding: EdgeInsets.all(12),
+                      child: ResultWhatsappIcon(size: 28),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     ),
@@ -8124,11 +8277,11 @@ Color _drawColorForName(String drawTime) => _drawColorForTime(drawTime);
 
 void _openAddTicket(BuildContext context, String username, String draw) {
   if (UserStore.isSalesBlocked(username)) {
-    showErrorSnack(context, 'Sales blocked for this user. Contact admin.');
+    showErrorSnack(context, AppMsg.salesBlocked);
     return;
   }
   if (!_schemeAllowsDrawForUser(username, draw)) {
-    showErrorSnack(context, 'No draw available for your scheme');
+    showErrorSnack(context, AppMsg.noDrawForScheme);
     return;
   }
   Navigator.push(
@@ -8165,7 +8318,7 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
   @override
   Widget build(BuildContext context) {
     final selectedDraw = widget.selectedDraw;
-    final gradient = _drawGradientForTime(selectedDraw);
+    final drawColor = menuDrawColor(selectedDraw);
     final close = DrawScheduleStore.drawCloseTimeLabel(selectedDraw);
     final drawAt = _menuDrawResultTimeLabel(selectedDraw);
     final open =
@@ -8178,77 +8331,70 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
 
     return Container(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.red.shade300, width: 1.5),
+        borderRadius: BorderRadius.zero,
+        border: Border.all(color: Colors.white, width: 2),
       ),
       clipBehavior: Clip.antiAlias,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Material(
-            color: Colors.transparent,
+            color: drawColor,
             child: InkWell(
-              onTap: () => setState(() => _expanded = !_expanded),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: gradient,
-                    begin: Alignment.centerLeft,
-                    end: Alignment.centerRight,
-                  ),
-                ),
-                child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              selectedDraw,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 16,
-                                color: Colors.white,
-                              ),
+              onTap: allowed.length > 1
+                  ? () => setState(() => _expanded = !_expanded)
+                  : null,
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            menuDrawShortLabel(selectedDraw),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                              fontSize: 17,
+                              color: Colors.white,
                             ),
-                            const SizedBox(height: 4),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Close $close · Draw $drawAt',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                              color: Colors.white.withValues(alpha: 0.92),
+                            ),
+                          ),
+                          if (open && countdown != null) ...[
+                            const SizedBox(height: 3),
                             Text(
-                              'Close $close · Draw $drawAt',
+                              'Closes in $countdown',
                               style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w500,
-                                color: Colors.white.withValues(alpha: 0.92),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white.withValues(alpha: 0.88),
                               ),
                             ),
-                            if (open && countdown != null) ...[
-                              const SizedBox(height: 3),
-                              Text(
-                                'Closes in $countdown',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color:
-                                      Colors.white.withValues(alpha: 0.88),
-                                ),
+                          ] else if (!open) ...[
+                            const SizedBox(height: 3),
+                            Text(
+                              AppMsg.bookingClosedStatus,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white.withValues(alpha: 0.88),
                               ),
-                            ] else if (!open) ...[
-                              const SizedBox(height: 3),
-                              Text(
-                                'Booking closed',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color:
-                                      Colors.white.withValues(alpha: 0.88),
-                                ),
-                              ),
-                            ],
+                            ),
                           ],
-                        ),
+                        ],
                       ),
+                    ),
+                    if (allowed.length > 1)
                       Icon(
                         _expanded
                             ? Icons.arrow_drop_up
@@ -8256,32 +8402,56 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
                         color: Colors.white,
                         size: 30,
                       ),
-                    ],
-                  ),
+                  ],
                 ),
               ),
             ),
           ),
           if (_expanded)
             ColoredBox(
-              color: Colors.white,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  for (int i = 0; i < allowed.length; i++) ...[
-                    if (i > 0)
-                      Divider(height: 1, color: Colors.grey.shade200),
-                    _bookingDrawPickerTile(
-                      context,
-                      name: allowed[i],
-                      selected: allowed[i] == selectedDraw,
-                      onTap: () {
-                        setState(() => _expanded = false);
-                        widget.onDrawChanged(allowed[i]);
-                      },
-                    ),
+              color: kAppBlue,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (int i = 0; i < allowed.length; i++)
+                      Padding(
+                        padding: EdgeInsets.only(
+                          bottom: i == allowed.length - 1 ? 0 : 8,
+                        ),
+                        child: Material(
+                          color: menuDrawColor(allowed[i]),
+                          child: InkWell(
+                            onTap: () {
+                              setState(() => _expanded = false);
+                              widget.onDrawChanged(allowed[i]);
+                            },
+                            child: Container(
+                              width: double.infinity,
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 16),
+                              decoration: BoxDecoration(
+                                border: Border.all(
+                                  color: Colors.white,
+                                  width: 2,
+                                ),
+                              ),
+                              child: Text(
+                                menuDrawShortLabel(allowed[i]),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 17,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                   ],
-                ],
+                ),
               ),
             ),
         ],
@@ -8485,8 +8655,6 @@ class _WinningReportPageState extends State<WinningReportPage> {
 
   @override
   Widget build(BuildContext context) {
-    final tint = _salesDrawTint(drawFilter);
-
     return _reportPage(context: context, title: "Winning Report", body: ValueListenableBuilder<List<BillRecord>>(
         valueListenable: BillsStore.bills,
         builder: (context, bills, _) {
@@ -8498,6 +8666,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                 _salesDrawBar(
                   selected: drawFilter,
                   onChanged: (v) => setState(() => drawFilter = v),
+                  flat: true,
                 ),
                 const SizedBox(height: 10),
                 _reportFormCard(
@@ -8512,6 +8681,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                               label: "From",
                               value: fromDate,
                               onChanged: (d) => setState(() => fromDate = d),
+                              flat: true,
                             ),
                           ),
                           Padding(
@@ -8527,6 +8697,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                               label: "To",
                               value: toDate,
                               onChanged: (d) => setState(() => toDate = d),
+                              flat: true,
                             ),
                           ),
                         ],
@@ -8536,7 +8707,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                         controller: ticketNumberController,
                         keyboardType: TextInputType.number,
                         decoration:
-                            _salesFieldDecoration("Ticket Number (optional)"),
+                            _salesFieldDecoration("Ticket Number", flat: true),
                       ),
                       const SizedBox(height: 10),
                       Row(
@@ -8544,7 +8715,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                           Expanded(
                             child: DropdownButtonFormField<String>(
                               initialValue: groupFilter,
-                              decoration: _winningGroupDecoration(),
+                              decoration: _winningGroupDecoration(flat: true),
                               items: _winningGroupItems,
                               onChanged: (v) =>
                                   setState(() => groupFilter = v ?? "Select"),
@@ -8556,6 +8727,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                               value: userFilter,
                               onChanged: (v) =>
                                   setState(() => userFilter = v),
+                              flat: true,
                             ),
                           ),
                         ],
@@ -8574,30 +8746,12 @@ class _WinningReportPageState extends State<WinningReportPage> {
                             ),
                           );
                         },
+                        flat: true,
                         child: const Text("View Bills"),
                       ),
                     ],
                   ),
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: tint,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    drawFilter == "ALL"
-                        ? "All draws · winning tickets only"
-                        : "${_salesDrawLabel(drawFilter)} · winning tickets",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: _salesDrawColor(drawFilter),
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
+                  flat: true,
                 ),
               ],
             ),
@@ -8643,7 +8797,7 @@ class WinningDetailsPage extends StatelessWidget {
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
               color: Colors.white,
-              borderRadius: BorderRadius.circular(10),
+              borderRadius: BorderRadius.zero,
               border: Border.all(color: Colors.grey.shade300),
             ),
             child: Row(
@@ -8662,23 +8816,11 @@ class WinningDetailsPage extends StatelessWidget {
           Container(
             decoration: BoxDecoration(
               color: Colors.white,
-              borderRadius: BorderRadius.circular(10),
               border: Border.all(color: Colors.grey.shade300),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
-                  child: Text(
-                    '${filteredBills.length} bills · ${allWinningRows.length} winning lines',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.grey.shade700,
-                    ),
-                  ),
-                ),
                 if (allWinningRows.isEmpty)
                   Padding(
                     padding: const EdgeInsets.all(16),
@@ -8723,9 +8865,6 @@ class _WinningBillWiseSearchPageState extends State<WinningBillWiseSearchPage> {
     super.dispose();
   }
 
-  String _dateText(DateTime d) =>
-      "${d.day.toString().padLeft(2, "0")}/${d.month.toString().padLeft(2, "0")}/${d.year}";
-
   bool _sameDate(DateTime a, DateTime b) => isSameBusinessDate(a, b);
 
   List<BillRecord> _filteredBills(List<BillRecord> bills) {
@@ -8764,8 +8903,6 @@ class _WinningBillWiseSearchPageState extends State<WinningBillWiseSearchPage> {
 
   @override
   Widget build(BuildContext context) {
-    final tint = _salesDrawTint(drawFilter);
-
     return _reportPage(context: context, title: "Winning Bill Wise", body: ValueListenableBuilder<List<BillRecord>>(
         valueListenable: BillsStore.bills,
         builder: (context, bills, _) {
@@ -8794,7 +8931,7 @@ class _WinningBillWiseSearchPageState extends State<WinningBillWiseSearchPage> {
                         controller: ticketNumberController,
                         keyboardType: TextInputType.number,
                         decoration:
-                            _salesFieldDecoration("Ticket Number (optional)"),
+                            _salesFieldDecoration("Ticket Number"),
                       ),
                       const SizedBox(height: 10),
                       Row(
@@ -8844,24 +8981,6 @@ class _WinningBillWiseSearchPageState extends State<WinningBillWiseSearchPage> {
                     ],
                   ),
                 ),
-                const SizedBox(height: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: tint,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    "Bill wise search · ${_dateText(selectedDate)}",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: _salesDrawColor(drawFilter),
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
               ],
             ),
           );
@@ -8905,8 +9024,6 @@ class _NetPayPageState extends State<NetPayPage> {
 
   @override
   Widget build(BuildContext context) {
-    final tint = _salesDrawTint(drawFilter);
-
     return _reportPage(
       context: context,
       title: "Net Pay",
@@ -8921,6 +9038,7 @@ class _NetPayPageState extends State<NetPayPage> {
                 _salesDrawBar(
                   selected: drawFilter,
                   onChanged: (v) => setState(() => drawFilter = v),
+                  flat: true,
                 ),
                 const SizedBox(height: 10),
                 _reportFormCard(
@@ -8936,6 +9054,7 @@ class _NetPayPageState extends State<NetPayPage> {
                               value: fromDate,
                               onChanged: (d) =>
                                   setState(() => fromDate = d),
+                              flat: true,
                             ),
                           ),
                           Padding(
@@ -8951,6 +9070,7 @@ class _NetPayPageState extends State<NetPayPage> {
                               label: "To",
                               value: toDate,
                               onChanged: (d) => setState(() => toDate = d),
+                              flat: true,
                             ),
                           ),
                         ],
@@ -8961,7 +9081,7 @@ class _NetPayPageState extends State<NetPayPage> {
                           Expanded(
                             child: DropdownButtonFormField<String>(
                               initialValue: groupFilter,
-                              decoration: _winningGroupDecoration(),
+                              decoration: _winningGroupDecoration(flat: true),
                               items: _winningGroupItems,
                               onChanged: (v) =>
                                   setState(() => groupFilter = v ?? "Select"),
@@ -8973,6 +9093,7 @@ class _NetPayPageState extends State<NetPayPage> {
                               value: userFilter,
                               onChanged: (v) =>
                                   setState(() => userFilter = v),
+                              flat: true,
                             ),
                           ),
                         ],
@@ -8993,30 +9114,12 @@ class _NetPayPageState extends State<NetPayPage> {
                             ),
                           );
                         },
+                        flat: true,
                         child: const Text("Generate Report"),
                       ),
                     ],
                   ),
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: tint,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    drawFilter == "ALL"
-                        ? "All draws · sales minus winnings"
-                        : "${_salesDrawLabel(drawFilter)} · net pay",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: _salesDrawColor(drawFilter),
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
+                  flat: true,
                 ),
               ],
             ),
@@ -9041,9 +9144,16 @@ class NetPayResultPage extends StatelessWidget {
     required this.toDate,
   });
 
-  double _billWinnings(BillRecord bill) {
-    return _winningRowsForBill(bill, drawFilter: drawFilter).fold<double>(
-        0.0, (s, r) => s + BillRecord.winningTotalFromRow(r));
+  ({double win, double superAmt, double total}) _billWinningBreakdown(
+    BillRecord bill,
+  ) {
+    double win = 0;
+    double superAmt = 0;
+    for (final r in _winningRowsForBill(bill, drawFilter: drawFilter)) {
+      win += BillRecord.winningWinFromRow(r);
+      superAmt += BillRecord.winningSuperFromRow(r);
+    }
+    return (win: win, superAmt: superAmt, total: win + superAmt);
   }
 
   String _dateRangeText() {
@@ -9054,14 +9164,16 @@ class NetPayResultPage extends StatelessWidget {
     return f == t ? f : "$f — $t";
   }
 
-  Map<String, ({double sales, double win})> _userTotals() {
-    final map = <String, ({double sales, double win})>{};
+  Map<String, ({double sales, double win, double superAmt})> _userTotals() {
+    final map = <String, ({double sales, double win, double superAmt})>{};
     for (final bill in filteredBills) {
       final user = bill.username.trim().isEmpty ? "Unknown" : bill.username;
-      final prev = map[user] ?? (sales: 0.0, win: 0.0);
+      final prev = map[user] ?? (sales: 0.0, win: 0.0, superAmt: 0.0);
+      final breakdown = _billWinningBreakdown(bill);
       map[user] = (
         sales: prev.sales + bill.totalAmount,
-        win: prev.win + _billWinnings(bill),
+        win: prev.win + breakdown.win,
+        superAmt: prev.superAmt + breakdown.superAmt,
       );
     }
     return map;
@@ -9071,10 +9183,10 @@ class NetPayResultPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final sales =
         filteredBills.fold<double>(0.0, (s, b) => s + b.totalAmount);
-    final winnings =
-        filteredBills.fold<double>(0.0, (s, b) => s + _billWinnings(b));
-    final gBalance = sales - winnings;
-    final nBalance = gBalance;
+    final winTotals =
+        _rangeWinningTotals(filteredBills, drawFilter: drawFilter);
+    final winnings = winTotals.total;
+    final nBalance = sales - winnings;
     final userTotals = _userTotals();
     final tint = _salesDrawTint(drawFilter);
     final sortedUsers = userTotals.keys.toList()..sort();
@@ -9088,10 +9200,10 @@ class NetPayResultPage extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
               decoration: BoxDecoration(
                 color: tint,
-                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.grey.shade300),
               ),
               child: Row(
                 children: [
@@ -9105,184 +9217,66 @@ class NetPayResultPage extends StatelessWidget {
                       ),
                     ),
                   ),
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.7),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Text(
-                      _salesDrawLabel(drawFilter),
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: _salesDrawColor(drawFilter),
-                      ),
+                  Text(
+                    _salesDrawLabel(drawFilter),
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: _salesDrawColor(drawFilter),
                     ),
                   ),
                 ],
               ),
             ),
             const SizedBox(height: 10),
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: Colors.grey.shade300),
-              ),
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      _salesStatChip(
-                        "Sales",
-                        sales.toStringAsFixed(0),
-                        tint,
-                      ),
-                      const SizedBox(width: 8),
-                      _salesStatChip(
-                        "Winnings",
-                        winnings.toStringAsFixed(0),
-                        const Color(0xFFFFEBEE),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      _salesStatChip(
-                        "G. Balance",
-                        gBalance.toStringAsFixed(0),
-                        const Color(0xFFE8F5F3),
-                      ),
-                      const SizedBox(width: 8),
-                      _salesStatChip(
-                        "N. Balance",
-                        nBalance.toStringAsFixed(0),
-                        _appGradient.first.withValues(alpha: 0.12),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+            _netPayFlatHeaderRow(),
+            _netPayFlatDataRow(
+              user: 'TOTAL',
+              sale: sales,
+              win: winTotals.win,
+              superAmt: winTotals.superAmt,
+              totalWin: winnings,
+              nBal: nBalance,
+              bg: tint,
+              bold: true,
             ),
-            const SizedBox(height: 14),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: Text(
-                "Users (${sortedUsers.length})",
-                style: TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.grey.shade700,
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
             if (sortedUsers.isEmpty)
               Container(
-                padding: const EdgeInsets.all(24),
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 24),
                 decoration: BoxDecoration(
                   color: Colors.white,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.grey.shade300),
+                  border: Border(
+                    left: BorderSide(color: Colors.grey.shade300),
+                    right: BorderSide(color: Colors.grey.shade300),
+                    bottom: BorderSide(color: Colors.grey.shade300),
+                  ),
                 ),
-                child: Column(
-                  children: [
-                    Icon(Icons.receipt_long_outlined,
-                        size: 40, color: Colors.grey.shade400),
-                    const SizedBox(height: 8),
-                    Text(
-                      "No bills in selected range",
-                      style: TextStyle(color: Colors.grey.shade500),
-                    ),
-                  ],
+                child: Text(
+                  'No bills in selected range',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.grey.shade500),
                 ),
               )
             else
-              ...sortedUsers.map((user) {
+              ...sortedUsers.asMap().entries.map((entry) {
+                final i = entry.key;
+                final user = entry.value;
                 final totals = userTotals[user]!;
-                final gBal = totals.sales - totals.win;
-                final pct = totals.sales > 0
-                    ? (totals.win / totals.sales * 100).toStringAsFixed(1)
-                    : "0.0";
-
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            colors: [
-                              _appGradient.first.withValues(alpha: 0.1),
-                              Colors.white,
-                            ],
-                          ),
-                          borderRadius: const BorderRadius.vertical(
-                            top: Radius.circular(10),
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.all(8),
-                              decoration: BoxDecoration(
-                                gradient: LinearGradient(
-                                  colors: _appGradient,
-                                ),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: const Icon(
-                                Icons.person_outline,
-                                color: Colors.white,
-                                size: 18,
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                user,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 15,
-                                ),
-                              ),
-                            ),
-                            Text(
-                              "N. ₹${gBal.toStringAsFixed(0)}",
-                              style: TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 15,
-                                color: _appPrimary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-                        child: Row(
-                          children: [
-                            _netPayMiniStat("Sale", totals.sales),
-                            _netPayMiniStat("Win", totals.win),
-                            _netPayMiniStat("G. Bal", gBal),
-                            _netPayMiniStat("Win %", double.tryParse(pct)),
-                            _netPayMiniStat("N. Bal", gBal),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
+                final totalWin = totals.win + totals.superAmt;
+                final nBal = totals.sales - totalWin;
+                final rowBg = drawFilter != 'ALL'
+                    ? _salesDrawTint(drawFilter)
+                    : _kWinningPrizeLiteColors[
+                        i % _kWinningPrizeLiteColors.length];
+                return _netPayFlatDataRow(
+                  user: user,
+                  sale: totals.sales,
+                  win: totals.win,
+                  superAmt: totals.superAmt,
+                  totalWin: totalWin,
+                  nBal: nBal,
+                  bg: rowBg,
                 );
               }),
           ],
@@ -9291,32 +9285,115 @@ class NetPayResultPage extends StatelessWidget {
     );
   }
 
-  Widget _netPayMiniStat(String label, double? value) {
-    final text = value == null
-        ? label.contains("%")
-            ? "0%"
-            : "0"
-        : label.contains("%")
-            ? "${value.toStringAsFixed(1)}%"
-            : value.toStringAsFixed(0);
-    return Expanded(
-      child: Column(
+  Widget _netPayFlatHeaderRow() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+      decoration: BoxDecoration(
+        color: kAppBlue,
+        border: Border.all(color: Colors.grey.shade300),
+      ),
+      child: Row(
         children: [
-          Text(
-            label,
-            style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
-            textAlign: TextAlign.center,
+          _netPayFlatCell('User', flex: 3, header: true, align: TextAlign.left),
+          _netPayFlatCell('Sale', header: true),
+          _netPayFlatCell('Win', header: true),
+          _netPayFlatCell('Super', header: true),
+          _netPayFlatCell('Tot Win', header: true),
+          _netPayFlatCell('N.Bal', header: true),
+        ],
+      ),
+    );
+  }
+
+  Widget _netPayFlatDataRow({
+    required String user,
+    required double sale,
+    required double win,
+    required double superAmt,
+    required double totalWin,
+    required double nBal,
+    Color? bg,
+    bool bold = false,
+  }) {
+    const winTint = Color(0xFFFFEBEE);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+      decoration: BoxDecoration(
+        color: bg ?? Colors.white,
+        border: Border(
+          left: BorderSide(color: Colors.grey.shade300),
+          right: BorderSide(color: Colors.grey.shade300),
+          bottom: BorderSide(color: Colors.grey.shade300),
+        ),
+      ),
+      child: Row(
+        children: [
+          _netPayFlatCell(
+            user,
+            flex: 3,
+            bold: bold,
+            align: TextAlign.left,
           ),
-          const SizedBox(height: 3),
-          Text(
-            text,
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-            ),
-            textAlign: TextAlign.center,
+          _netPayFlatCell(sale.toStringAsFixed(0), bold: bold),
+          _netPayFlatCell(
+            win.toStringAsFixed(0),
+            bold: bold,
+            bg: winTint,
+            textColor: const Color(0xFFC62828),
+          ),
+          _netPayFlatCell(
+            superAmt.toStringAsFixed(0),
+            bold: bold,
+            bg: winTint,
+            textColor: const Color(0xFFC62828),
+          ),
+          _netPayFlatCell(
+            totalWin.toStringAsFixed(0),
+            bold: bold,
+            bg: winTint,
+            textColor: const Color(0xFFB71C1C),
+          ),
+          _netPayFlatCell(
+            nBal.toStringAsFixed(0),
+            bold: bold,
+            bg: const Color(0xFFE3F2FD),
+            textColor: _appPrimary,
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _netPayFlatCell(
+    String text, {
+    int flex = 2,
+    bool header = false,
+    bool bold = false,
+    TextAlign align = TextAlign.right,
+    Color? color,
+    Color? textColor,
+    Color? bg,
+  }) {
+    return Expanded(
+      flex: flex,
+      child: Container(
+        color: bg,
+        padding: bg != null
+            ? const EdgeInsets.symmetric(vertical: 2, horizontal: 2)
+            : EdgeInsets.zero,
+        child: Text(
+          text,
+          textAlign: align,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: header ? 12 : 13,
+            fontWeight: header || bold ? FontWeight.w700 : FontWeight.w500,
+            color: header
+                ? Colors.white
+                : (textColor ?? color ?? const Color(0xFF263238)),
+          ),
+        ),
       ),
     );
   }
@@ -9388,8 +9465,6 @@ class _NumberWiseReportPageState extends State<NumberWiseReportPage> {
 
   @override
   Widget build(BuildContext context) {
-    final tint = _salesDrawTint(drawFilter);
-
     return _reportPage(
       context: context,
       title: "Number Wise Report",
@@ -9421,7 +9496,7 @@ class _NumberWiseReportPageState extends State<NumberWiseReportPage> {
                         controller: ticketNumberController,
                         keyboardType: TextInputType.number,
                         decoration:
-                            _salesFieldDecoration("Ticket Number (optional)"),
+                            _salesFieldDecoration("Ticket Number"),
                       ),
                       const SizedBox(height: 10),
                       Row(
@@ -9450,9 +9525,9 @@ class _NumberWiseReportPageState extends State<NumberWiseReportPage> {
                       const SizedBox(height: 8),
                       Material(
                         color: const Color(0xFFF5F7FA),
-                        borderRadius: BorderRadius.circular(8),
+                        borderRadius: BorderRadius.zero,
                         child: InkWell(
-                          borderRadius: BorderRadius.circular(8),
+                          borderRadius: BorderRadius.zero,
                           onTap: () => setState(
                               () => groupWithoutTicketName =
                                   !groupWithoutTicketName),
@@ -9499,26 +9574,6 @@ class _NumberWiseReportPageState extends State<NumberWiseReportPage> {
                         child: const Text("Generate Report"),
                       ),
                     ],
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: tint,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    drawFilter == "ALL"
-                        ? "All draws · numbers grouped by count"
-                        : "${_salesDrawLabel(drawFilter)} · number wise",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: _salesDrawColor(drawFilter),
-                      fontWeight: FontWeight.w500,
-                    ),
                   ),
                 ),
               ],
@@ -9607,7 +9662,7 @@ class NumberWiseResultPage extends StatelessWidget {
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   decoration: BoxDecoration(
                     color: tint,
-                    borderRadius: BorderRadius.circular(8),
+                    borderRadius: BorderRadius.zero,
                   ),
                   child: Row(
                     children: [
@@ -9626,7 +9681,7 @@ class NumberWiseResultPage extends StatelessWidget {
                             horizontal: 8, vertical: 4),
                         decoration: BoxDecoration(
                           color: Colors.white.withValues(alpha: 0.7),
-                          borderRadius: BorderRadius.circular(6),
+                          borderRadius: BorderRadius.zero,
                         ),
                         child: Text(
                           _salesDrawLabel(drawFilter),
@@ -9645,7 +9700,7 @@ class NumberWiseResultPage extends StatelessWidget {
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
                     color: Colors.white,
-                    borderRadius: BorderRadius.circular(10),
+                    borderRadius: BorderRadius.zero,
                     border: Border.all(color: Colors.grey.shade300),
                   ),
                   child: Row(
@@ -9685,7 +9740,7 @@ class NumberWiseResultPage extends StatelessWidget {
                   margin: const EdgeInsets.only(bottom: 8),
                   decoration: BoxDecoration(
                     color: Colors.white,
-                    borderRadius: BorderRadius.circular(10),
+                    borderRadius: BorderRadius.zero,
                     border: Border.all(color: Colors.grey.shade300),
                   ),
                   child: Padding(
@@ -9699,7 +9754,7 @@ class NumberWiseResultPage extends StatelessWidget {
                           alignment: Alignment.center,
                           decoration: BoxDecoration(
                             color: bg,
-                            borderRadius: BorderRadius.circular(8),
+                            borderRadius: BorderRadius.zero,
                           ),
                           child: Text(
                             "${i + 1}",
@@ -9739,10 +9794,8 @@ class NumberWiseResultPage extends StatelessWidget {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 12, vertical: 6),
                           decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              colors: [color, color.withValues(alpha: 0.75)],
-                            ),
-                            borderRadius: BorderRadius.circular(8),
+                            color: color,
+                            borderRadius: BorderRadius.zero,
                           ),
                           child: Text(
                             "$count",
@@ -9761,9 +9814,7 @@ class NumberWiseResultPage extends StatelessWidget {
             ),
           ),
           DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(colors: _appGradient),
-            ),
+            decoration: const BoxDecoration(color: kAppBlue),
             child: SafeArea(
               top: false,
               child: Padding(
@@ -9864,8 +9915,6 @@ class _SalesReportPageState extends State<SalesReportPage> {
 
   @override
   Widget build(BuildContext context) {
-    final tint = _salesDrawTint(drawFilter);
-
     return _reportPage(context: context, title: "Sales Report", body: ValueListenableBuilder<List<BillRecord>>(
         valueListenable: BillsStore.bills,
         builder: (context, bills, _) {
@@ -9877,6 +9926,7 @@ class _SalesReportPageState extends State<SalesReportPage> {
                 _salesDrawBar(
                   selected: drawFilter,
                   onChanged: (v) => setState(() => drawFilter = v),
+                  flat: true,
                 ),
                 const SizedBox(height: 10),
                 _reportFormCard(
@@ -9904,7 +9954,7 @@ class _SalesReportPageState extends State<SalesReportPage> {
                       TextField(
                         controller: ticketNumberController,
                         decoration:
-                            _salesFieldDecoration("Ticket Number (optional)"),
+                            _salesFieldDecoration("Ticket Number", flat: true),
                         keyboardType: TextInputType.number,
                       ),
                       const SizedBox(height: 10),
@@ -9917,14 +9967,17 @@ class _SalesReportPageState extends State<SalesReportPage> {
                               value: userFilter,
                               onChanged: (v) =>
                                   setState(() => userFilter = v),
+                              flat: true,
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 14),
+                      const SizedBox(height: 10),
                       _appGradientButton(
                         onPressed: () {
-                          final filtered = _filteredBills(bills);
+                          final filtered = _filteredBills(bills)
+                              .map((b) => BillsStore.byBillNo(b.billNo) ?? b)
+                              .toList();
                           Navigator.push(
                             context,
                             appRoute(
@@ -9936,30 +9989,12 @@ class _SalesReportPageState extends State<SalesReportPage> {
                             ),
                           );
                         },
+                        flat: true,
                         child: const Text("View Bills"),
                       ),
                     ],
                   ),
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: tint,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    drawFilter == "ALL"
-                        ? "All draws · ${fromDate.day.toString().padLeft(2, '0')}/${fromDate.month.toString().padLeft(2, '0')}/${fromDate.year}"
-                        : "${_salesDrawLabel(drawFilter)} · ${fromDate.day.toString().padLeft(2, '0')}/${fromDate.month.toString().padLeft(2, '0')}/${fromDate.year}",
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: _salesDrawColor(drawFilter),
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
+                  flat: true,
                 ),
               ],
             ),
@@ -9972,7 +10007,7 @@ class _SalesReportPageState extends State<SalesReportPage> {
   Widget _groupDropdown() {
     return DropdownButtonFormField<String>(
       initialValue: groupFilter,
-      decoration: _salesFieldDecoration("Digits"),
+      decoration: _salesFieldDecoration("Digits", flat: true),
       items: const [
         DropdownMenuItem(value: "Select", child: Text("All")),
         DropdownMenuItem(value: "3", child: Text("3 digit")),
@@ -9996,7 +10031,7 @@ class _SalesReportPageState extends State<SalesReportPage> {
         if (picked != null) onChanged(_calendarDate(picked));
       },
       child: InputDecorator(
-        decoration: _salesFieldDecoration(label),
+        decoration: _salesFieldDecoration(label, flat: true),
         child: Text(
           "${value.day.toString().padLeft(2, "0")}/${value.month.toString().padLeft(2, "0")}/${value.year}",
           textAlign: TextAlign.center,
@@ -10030,11 +10065,6 @@ class _SalesReportEmptyBody extends StatelessWidget {
                 color: Colors.grey.shade700,
               ),
             ),
-            const SizedBox(height: 6),
-            Text(
-              "Count : 0  ·  Amount : 0.00",
-              style: TextStyle(fontSize: 14, color: Colors.grey.shade500),
-            ),
           ],
         ),
       ),
@@ -10062,37 +10092,115 @@ class SalesReportDetailedPage extends StatefulWidget {
 
 class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
   late List<BillRecord> _bills;
-  BillRecord? _viewingBill;
+  final Set<int> _expandedBillNos = {};
+  bool _expandAll = false;
 
   static const Color _rcData = Color(0xFF212121);
-  static const Color _rcTotal = Color(0xFFC62828);
 
   @override
   void initState() {
     super.initState();
-    _bills = List<BillRecord>.from(widget.filteredBills);
+    _bills = widget.filteredBills
+        .map((b) => BillsStore.byBillNo(b.billNo) ?? b)
+        .toList();
   }
 
-  String _billDate(DateTime dt) {
+  List<BillRecord> get _visibleBills =>
+      _bills.where((b) => _billRowsForFilter(b).isNotEmpty).toList();
+
+  List<Map<String, dynamic>> _billRowsForFilter(BillRecord bill) {
+    final out = <Map<String, dynamic>>[];
+    for (final row in bill.rows) {
+      if (!_salesRowMatchesDraw(row, widget.drawFilter)) continue;
+      final count = int.tryParse(row['count'].toString()) ?? 0;
+      if (count <= 0) continue;
+      out.add(row);
+    }
+    return out;
+  }
+
+  void _toggleExpandAll() {
+    setState(() {
+      _expandAll = !_expandAll;
+      if (_expandAll) {
+        _expandedBillNos
+          ..clear()
+          ..addAll(_visibleBills.map((b) => b.billNo));
+      } else {
+        _expandedBillNos.clear();
+      }
+    });
+  }
+
+  void _toggleBill(int billNo) {
+    setState(() {
+      if (_expandedBillNos.contains(billNo)) {
+        _expandedBillNos.remove(billNo);
+        _expandAll = false;
+      } else {
+        _expandedBillNos.add(billNo);
+        _expandAll = _expandedBillNos.length == _visibleBills.length;
+      }
+    });
+  }
+
+  String _billDateShort(DateTime dt) {
     final local = dt.toLocal();
-    return '${local.day.toString().padLeft(2, '0')}/'
-        '${local.month.toString().padLeft(2, '0')}/'
-        '${local.year}';
+    return '${local.month.toString().padLeft(2, '0')}-'
+        '${local.day.toString().padLeft(2, '0')}-'
+        '${(local.year % 100).toString().padLeft(2, '0')}';
   }
 
-  String _billTime(DateTime dt) {
+  String _billTime24(DateTime dt) {
     final local = dt.toLocal();
-    final hour12 = local.hour % 12 == 0 ? 12 : local.hour % 12;
-    final ampm = local.hour >= 12 ? 'PM' : 'AM';
-    return '$hour12:${local.minute.toString().padLeft(2, '0')} $ampm';
+    return '${local.hour.toString().padLeft(2, '0')}:'
+        '${local.minute.toString().padLeft(2, '0')}:'
+        '${local.second.toString().padLeft(2, '0')}';
   }
 
-  void _openReceipt(BillRecord bill) {
-    setState(() => _viewingBill = bill);
-  }
+  Future<void> _confirmDeleteBill(BillRecord bill) async {
+    final now = DateTime.now();
+    if (!bill.isModifiable(at: now)) {
+      final msg = bill.modifyBlockMessage(at: now);
+      if (msg != null) showErrorSnack(context, msg);
+      return;
+    }
 
-  void _closeReceipt() {
-    setState(() => _viewingBill = null);
+    final ok = await showAppDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(AppMsg.deleteBillTitle),
+        content: Text(
+          AppMsg.deleteBillBody(bill.billNo),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(AppMsg.cancel),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: Text(AppMsg.delete),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    BillsStore.delete(bill.billNo);
+    setState(() {
+      _bills.removeWhere((b) => b.billNo == bill.billNo);
+      _expandedBillNos.remove(bill.billNo);
+      if (_expandedBillNos.length != _visibleBills.length) {
+        _expandAll = false;
+      }
+    });
+    if (_bills.isEmpty && mounted) {
+      Navigator.pop(context);
+      return;
+    }
+    showSuccessSnack(context, AppMsg.billDeleted(bill.billNo));
   }
 
   Future<void> _openReceiptEditPage(BillRecord bill) async {
@@ -10105,17 +10213,19 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     setState(() {
       if (deleted == true) {
         _bills.removeWhere((b) => b.billNo == bill.billNo);
-        if (_viewingBill?.billNo == bill.billNo) _viewingBill = null;
+        _expandedBillNos.remove(bill.billNo);
       } else {
         final updated = BillsStore.byBillNo(bill.billNo);
         if (updated == null) {
           _bills.removeWhere((b) => b.billNo == bill.billNo);
-          if (_viewingBill?.billNo == bill.billNo) _viewingBill = null;
+          _expandedBillNos.remove(bill.billNo);
         } else {
           final idx = _bills.indexWhere((b) => b.billNo == bill.billNo);
           if (idx >= 0) _bills[idx] = updated;
-          if (_viewingBill?.billNo == bill.billNo) _viewingBill = updated;
         }
+      }
+      if (_expandedBillNos.length != _visibleBills.length) {
+        _expandAll = false;
       }
     });
 
@@ -10124,41 +10234,103 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     }
   }
 
-  String _formatReceiptRate(double rate) => rate.toStringAsFixed(2);
-
-  double _rowRateFromBillRow(Map<String, dynamic> row) {
-    if (row.containsKey('rate')) {
-      return BillRecord.readRowRate(row['rate']);
+  String _salesDrawFooterLabel(String code) {
+    switch (code.toUpperCase()) {
+      case 'DEAR1':
+        return menuDrawShortLabel('DEAR 1 PM');
+      case 'LSK3':
+        return menuDrawShortLabel('LSK 3 PM');
+      case 'DEAR6':
+        return menuDrawShortLabel('DEAR 6 PM');
+      case 'DEAR8':
+        return menuDrawShortLabel('DEAR 8 PM');
+      default:
+        return _salesDrawLabel(code);
     }
-    final count = int.tryParse(row['count'].toString()) ?? 0;
-    final amount = BillRecord.readRowAmount(row['amount']);
-    return count > 0 ? amount / count : 0;
   }
 
-  Widget _receiptMiniStat(
-    String label,
-    String value,
-    Color valueColor, {
-    Color labelColor = _rcData,
+  Color _salesDetailRowColor(String type) {
+    final code = widget.drawFilter != 'ALL'
+        ? widget.drawFilter
+        : _drawCodeFromRowType(type);
+    return _salesDrawColor(code);
+  }
+
+  Widget _salesReportFooter({
+    required int count,
+    required double amount,
   }) {
-    return Expanded(
+    final drawCode = widget.drawFilter;
+    final drawColor = drawCode != 'ALL'
+        ? _salesDrawColor(drawCode)
+        : kAppBlueLight;
+    final drawLabel =
+        drawCode != 'ALL' ? _salesDrawFooterLabel(drawCode) : null;
+
+    Widget totalCell(String label, String value) {
+      return Expanded(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 13,
+                fontStyle: FontStyle.italic,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey.shade600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              value,
+              style: const TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+                color: _rcData,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return SafeArea(
+      top: false,
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(fontSize: 10, color: labelColor),
-          ),
-          const SizedBox(height: 3),
-          Text(
-            value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              color: valueColor,
+          if (drawLabel != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              color: drawColor,
+              child: Text(
+                drawLabel,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 14,
+                ),
+              ),
+            ),
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              border: Border(
+                top: BorderSide(
+                  color: drawColor.withValues(alpha: 0.45),
+                  width: 2,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                totalCell('COUNT', count.toStringAsFixed(2)),
+                totalCell('AMOUNT', formatSalesAmount(amount)),
+              ],
             ),
           ),
         ],
@@ -10166,101 +10338,32 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     );
   }
 
-  Widget _receiptTotalsBar({
-    required ({int count, double agent, double retail, double commission}) totals,
-    required Color accent,
-  }) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-      decoration: BoxDecoration(
-        color: accent,
-        border: Border(
-          bottom: BorderSide(color: accent.withValues(alpha: 0.85)),
-        ),
-      ),
-      child: Row(
-        children: [
-          _receiptMiniStat(
-            'Qty',
-            '${totals.count}',
-            Colors.white,
-            labelColor: Colors.white70,
-          ),
-          _receiptMiniStat(
-            'Agent Price',
-            formatSalesAmount(totals.agent),
-            Colors.white,
-            labelColor: Colors.white70,
-          ),
-          _receiptMiniStat(
-            'Total Amount',
-            formatSalesAmount(totals.retail),
-            const Color(0xFFFF8A80),
-            labelColor: Colors.white70,
-          ),
-          _receiptMiniStat(
-            'Commission',
-            formatSalesAmount(totals.commission),
-            Colors.white,
-            labelColor: Colors.white70,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _receiptLinesHeader({required Color accent}) {
-    const hdr = TextStyle(
-      fontSize: 13,
+  Widget _salesExpandedLineRow(Map<String, dynamic> row) {
+    final type = row['type'].toString();
+    final count = row['count'].toString();
+    final amount = BillRecord.readRowAmount(row['amount']);
+    final rowColor = _salesDetailRowColor(type);
+    const lineStyle = TextStyle(
+      fontSize: 15,
       fontWeight: FontWeight.w700,
       color: Colors.white,
     );
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: accent,
-        border: Border(
-          bottom: BorderSide(color: accent.withValues(alpha: 0.85)),
-        ),
-      ),
-      child: const Row(
-        children: [
-          Expanded(flex: 3, child: Text('Type', style: hdr)),
-          Expanded(
-            flex: 2,
-            child: Text('No', textAlign: TextAlign.center, style: hdr),
-          ),
-          Expanded(
-            flex: 1,
-            child: Text('Cnt', textAlign: TextAlign.center, style: hdr),
-          ),
-          Expanded(
-            flex: 2,
-            child: Text('Rate', textAlign: TextAlign.center, style: hdr),
-          ),
-          Expanded(
-            flex: 2,
-            child: Text('Amt', textAlign: TextAlign.end, style: hdr),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _receiptLineRow(Map<String, dynamic> row, {required int index}) {
-    final count = row['count'].toString();
-    final rate = _rowRateFromBillRow(row);
-    final amount = BillRecord.readRowAmount(row['amount']);
-    final shaded = index.isOdd;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: shaded ? _winningGreenLight : Colors.white,
+        color: rowColor,
         border: Border(
           bottom: BorderSide(
-            color: shaded
-                ? _winningGreen.withValues(alpha: 0.15)
-                : Colors.grey.shade200,
+            color: Colors.white.withValues(alpha: 0.28),
+            width: 0.5,
+          ),
+          left: BorderSide(
+            color: Colors.white.withValues(alpha: 0.18),
+            width: 0.5,
+          ),
+          right: BorderSide(
+            color: Colors.white.withValues(alpha: 0.18),
+            width: 0.5,
           ),
         ),
       ),
@@ -10269,12 +10372,8 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
           Expanded(
             flex: 3,
             child: Text(
-              row['type'].toString(),
-              style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
-                color: _rcData,
-              ),
+              _salesRowTypeDisplayLabel(type),
+              style: lineStyle,
               overflow: TextOverflow.ellipsis,
             ),
           ),
@@ -10283,35 +10382,14 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
             child: Text(
               row['number'].toString(),
               textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w700,
-                color: _rcData,
-              ),
+              style: lineStyle,
             ),
           ),
           Expanded(
-            flex: 1,
             child: Text(
               count,
               textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                color: _rcData,
-              ),
-            ),
-          ),
-          Expanded(
-            flex: 2,
-            child: Text(
-              _formatReceiptRate(rate),
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                color: _rcData,
-              ),
+              style: lineStyle,
             ),
           ),
           Expanded(
@@ -10319,11 +10397,7 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
             child: Text(
               amount.toStringAsFixed(2),
               textAlign: TextAlign.end,
-              style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-                color: _rcData,
-              ),
+              style: lineStyle,
             ),
           ),
         ],
@@ -10331,385 +10405,191 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     );
   }
 
-  Widget _receiptGateHeader() {
-    final labelStyle = TextStyle(
-      fontSize: 13,
-      fontWeight: FontWeight.w600,
-      color: Colors.grey.shade800,
-    );
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.grey.shade100,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          Expanded(flex: 2, child: Text('Bill', style: labelStyle)),
-          Expanded(flex: 1, child: Text('Draw', style: labelStyle)),
-          Expanded(flex: 2, child: Text('Date', style: labelStyle)),
-          Expanded(flex: 2, child: Text('Time', style: labelStyle)),
-          Expanded(
-            flex: 2,
-            child: Text(
-              'Amt',
-              textAlign: TextAlign.end,
-              maxLines: 1,
-              softWrap: false,
-              style: labelStyle.copyWith(
-                color: _rcTotal,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ),
-          const SizedBox(width: 22),
-        ],
-      ),
-    );
-  }
-
-  Widget _receiptGateRow({
-    required BillRecord bill,
-    required String drawLabel,
-    required Color drawColor,
-    required double agentAmount,
-    bool showOpenIcon = true,
-  }) {
-    return Row(
-      children: [
-        Expanded(
-          flex: 2,
-          child: Text(
-            '${bill.billNo}',
-            maxLines: 1,
-            softWrap: false,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontWeight: FontWeight.w700,
-              fontSize: 16,
-              color: _rcData,
-            ),
-          ),
-        ),
-        Expanded(
-          flex: 1,
-          child: Text(
-            drawLabel,
-            maxLines: 1,
-            softWrap: false,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontWeight: FontWeight.w700,
-              fontSize: 12,
-              color: drawColor,
-            ),
-          ),
-        ),
-        Expanded(
-          flex: 2,
-          child: Text(
-            _billDate(bill.businessDate),
-            maxLines: 1,
-            softWrap: false,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w500,
-              color: _rcData,
-            ),
-          ),
-        ),
-        Expanded(
-          flex: 2,
-          child: Text(
-            _billTime(bill.createdAt),
-            maxLines: 1,
-            softWrap: false,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w500,
-              color: _rcData,
-            ),
-          ),
-        ),
-        Expanded(
-          flex: 2,
-          child: Text(
-            formatSalesAmount(agentAmount),
-            textAlign: TextAlign.end,
-            maxLines: 1,
-            softWrap: false,
-            overflow: TextOverflow.clip,
-            style: const TextStyle(
-              fontWeight: FontWeight.w700,
-              fontSize: 15,
-              color: _rcTotal,
-            ),
-          ),
-        ),
-        Icon(
-          showOpenIcon ? Icons.chevron_right : Icons.keyboard_arrow_down,
-          color: Colors.grey.shade600,
-          size: 22,
-        ),
-      ],
-    );
-  }
-
-  String _drawCode(BillRecord bill) {
-    if (bill.rows.isEmpty) return "ALL";
-    final t = bill.rows.first["type"].toString().toUpperCase();
-    if (t.startsWith("DEAR1")) return "DEAR1";
-    if (t.startsWith("LSK3")) return "LSK3";
-    if (t.startsWith("DEAR6")) return "DEAR6";
-    if (t.startsWith("DEAR8")) return "DEAR8";
-    return "ALL";
-  }
-
-  Widget _buildFullReceiptView(BillRecord bill) {
-    final code = _drawCode(bill);
-    final color = _salesDrawColor(code);
-    final billTotals = _salesBillDetailsTotals(
-      [bill],
-      drawFilter: widget.drawFilter,
-    );
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
-      child: Material(
-        color: Colors.white,
-        elevation: 2,
-        shadowColor: Colors.black.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(12),
-        clipBehavior: Clip.antiAlias,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            border: Border.all(color: Colors.grey.shade300),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Material(
-                color: Colors.transparent,
-                child: InkWell(
-                  onLongPress: () => _openReceiptEditPage(bill),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 12),
-                    child: _receiptGateRow(
-                      bill: bill,
-                      drawLabel: _salesDrawLabel(code),
-                      drawColor: color,
-                      agentAmount: billTotals.agent,
-                      showOpenIcon: false,
-                    ),
-                  ),
-                ),
-              ),
-              const Divider(height: 1, thickness: 1),
-              _receiptTotalsBar(totals: billTotals, accent: color),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        bill.customerName.trim().isNotEmpty
-                            ? bill.customerName.trim()
-                            : bill.username,
-                        style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: _rcData,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const Spacer(),
-                    Text(
-                      _salesDrawLabel(code),
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                        color: color,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Qty ${billTotals.count}',
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                        color: _rcData,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              if (bill.rows.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Text(
-                    'No lines',
-                    style: TextStyle(color: Colors.grey.shade500),
-                  ),
-                )
-              else ...[
-                _receiptLinesHeader(accent: color),
-                ...bill.rows.asMap().entries.map(
-                      (e) => _receiptLineRow(e.value, index: e.key),
-                    ),
-              ],
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_viewingBill != null) {
-      final int idx =
-          _bills.indexWhere((b) => b.billNo == _viewingBill!.billNo);
-      final bill = idx >= 0 ? _bills[idx] : _viewingBill!;
-      return PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (didPop, _) {
-          if (!didPop) _closeReceipt();
-        },
-        child: _reportPage(
-          context: context,
-          title: 'Receipt ${bill.billNo}',
-          onBack: _closeReceipt,
-          body: ListView(
-            children: [_buildFullReceiptView(bill)],
-          ),
-        ),
-      );
-    }
-
+  Widget _salesBillCard(BillRecord bill) {
+    final displayBill = BillsStore.byBillNo(bill.billNo) ?? bill;
+    final expanded = _expandedBillNos.contains(displayBill.billNo);
+    final rows = _billRowsForFilter(displayBill);
     final totals = _salesBillDetailsTotals(
-      _bills,
+      [displayBill],
       drawFilter: widget.drawFilter,
     );
-    final drawColor = _salesDrawColor(widget.drawFilter);
+    const summaryStyle = TextStyle(
+      fontSize: 16,
+      fontWeight: FontWeight.w700,
+      color: kAppBlue,
+    );
+    final billName = displayBill.billNote;
 
-    return _reportPage(context: context, title: "Bill Details", body: _bills.isEmpty
-          ? const _SalesReportEmptyBody()
-          : ListView(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: Column(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Material(
+          color: Colors.white,
+          child: InkWell(
+            onTap: () => _toggleBill(displayBill.billNo),
+            onLongPress: () => _openReceiptEditPage(displayBill),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+              child: Column(
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
-                        children: [
-                          _salesDrawStatChip(
-                            "Total Count",
-                            "${totals.count}",
-                            drawColor,
-                          ),
-                          const SizedBox(width: 8),
-                          _salesDrawStatChip(
-                            "Agent Amount",
-                            formatSalesAmount(totals.agent),
-                            drawColor,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          _salesDrawStatChip(
-                            "Retail Amount",
-                            formatSalesAmount(totals.retail),
-                            drawColor,
-                          ),
-                          const SizedBox(width: 8),
-                          _salesDrawStatChip(
-                            "Sales Commission",
-                            formatSalesAmount(totals.commission),
-                            drawColor,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        'Retail rates: 1 Digit Rs 12 · 2 Digit Rs 10 · 3 Digit Rs 10',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey.shade600,
+                      Expanded(
+                        flex: 3,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('${displayBill.billNo}', style: summaryStyle),
+                            if (billName.isNotEmpty) ...[
+                              const SizedBox(height: 3),
+                              Text(
+                                billName,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: summaryStyle.copyWith(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w800,
+                                  color: kAppBlueDark,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Commission = Retail Amount − Agent Amount',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey.shade500,
+                      Expanded(
+                        flex: 3,
+                        child: Text(
+                          _billTime24(displayBill.createdAt),
+                          textAlign: TextAlign.center,
+                          style: summaryStyle,
+                        ),
+                      ),
+                      Expanded(
+                        flex: 2,
+                        child: Text(
+                          '${totals.count}',
+                          textAlign: TextAlign.center,
+                          style: summaryStyle,
+                        ),
+                      ),
+                      Expanded(
+                        flex: 3,
+                        child: Text(
+                          formatSalesAmount(totals.agent),
+                          textAlign: TextAlign.end,
+                          style: summaryStyle,
                         ),
                       ),
                     ],
                   ),
-                ),
-                const SizedBox(height: 10),
-                _receiptGateHeader(),
-                const SizedBox(height: 6),
-                ..._bills.map((bill) {
-                  final code = _drawCode(bill);
-                  final color = _salesDrawColor(code);
-                  final billTotals = _salesBillDetailsTotals(
-                    [bill],
-                    drawFilter: widget.drawFilter,
-                  );
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 14),
-                    child: Material(
-                      color: Colors.white,
-                      elevation: 2,
-                      shadowColor: Colors.black.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(12),
-                      clipBehavior: Clip.antiAlias,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          border: Border.all(color: Colors.grey.shade300),
-                          borderRadius: BorderRadius.circular(12),
+                  const SizedBox(height: 8),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _billDateShort(displayBill.businessDate),
+                          style: summaryStyle.copyWith(fontSize: 15),
                         ),
-                        child: Material(
-                          color: Colors.transparent,
-                          child: InkWell(
-                            onTap: () => _openReceipt(bill),
-                            onLongPress: () => _openReceiptEditPage(bill),
-                            borderRadius: BorderRadius.circular(12),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 12, vertical: 12),
-                              child: _receiptGateRow(
-                                bill: bill,
-                                drawLabel: _salesDrawLabel(code),
-                                drawColor: color,
-                                agentAmount: billTotals.agent,
+                      ),
+                      Material(
+                        color: Colors.grey.shade500,
+                        borderRadius: BorderRadius.zero,
+                        child: InkWell(
+                          onTap: () => _confirmDeleteBill(displayBill),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 7,
+                            ),
+                            child: Text(
+                              'Delete Bill',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 13,
                               ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  );
-                }),
-              ],
+                    ],
+                  ),
+                ],
+              ),
             ),
+          ),
+        ),
+        if (expanded)
+          Column(
+            children: rows.asMap().entries.map(
+                  (e) => _salesExpandedLineRow(e.value),
+                ).toList(),
+          ),
+        Divider(height: 1, thickness: 1, color: Colors.grey.shade300),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final totals = _salesBillDetailsTotals(
+      _bills,
+      drawFilter: widget.drawFilter,
+    );
+    final visibleBills = _visibleBills;
+
+    return Scaffold(
+      body: Container(
+        decoration: _reportPageBgDecoration(),
+        child: Scaffold(
+          backgroundColor: Colors.white,
+          appBar: _reportAppBar(
+            'Sales Report',
+            context,
+            extraActions: [
+              Padding(
+                padding: const EdgeInsets.only(right: 4),
+                child: OutlinedButton(
+                  onPressed:
+                      visibleBills.isEmpty ? null : _toggleExpandAll,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white, width: 1.5),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: Text(
+                    _expandAll ? 'COLLAPSE ALL' : 'EXPAND ALL',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          body: visibleBills.isEmpty
+              ? const _SalesReportEmptyBody()
+              : ListView.builder(
+                  itemCount: visibleBills.length,
+                  itemBuilder: (context, index) =>
+                      _salesBillCard(visibleBills[index]),
+                ),
+          bottomNavigationBar: visibleBills.isEmpty
+              ? null
+              : _salesReportFooter(
+                  count: totals.count,
+                  amount: totals.agent,
+                ),
+        ),
+      ),
     );
   }
 }
@@ -10766,25 +10646,25 @@ class _EditBillPageState extends State<EditBillPage> {
   void _search() {
     final int? billNo = int.tryParse(billNoController.text.trim());
     if (billNo == null) {
-      showErrorSnack(context, 'Enter a valid bill number');
+      showErrorSnack(context, AppMsg.enterValidBillNo);
       return;
     }
     final BillRecord? bill = BillsStore.byBillNo(billNo);
     setState(() => selectedBill = bill);
     if (bill == null) {
-      showErrorSnack(context, 'Bill $billNo not found');
+      showErrorSnack(context, AppMsg.billNotFound(billNo));
     }
   }
 
   Future<void> _deleteBill() async {
     final int? billNo = int.tryParse(billNoController.text.trim());
     if (billNo == null) {
-      showErrorSnack(context, 'Enter a valid bill number');
+      showErrorSnack(context, AppMsg.enterValidBillNo);
       return;
     }
     final BillRecord? bill = BillsStore.byBillNo(billNo);
     if (bill == null) {
-      showErrorSnack(context, 'Bill $billNo not found');
+      showErrorSnack(context, AppMsg.billNotFound(billNo));
       return;
     }
     if (!bill.isModifiable(at: _now)) {
@@ -10793,22 +10673,22 @@ class _EditBillPageState extends State<EditBillPage> {
       return;
     }
 
-    final bool? ok = await showDialog<bool>(
+    final bool? ok = await showAppDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text("Delete receipt?"),
+        title: Text(AppMsg.deleteReceiptTitle),
         content: Text(
-          "Bill $billNo and all lines will be permanently deleted.",
+          AppMsg.deleteReceiptBody(billNo),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text("Cancel"),
+            child: Text(AppMsg.cancel),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text("Delete"),
+            child: Text(AppMsg.delete),
           ),
         ],
       ),
@@ -10821,7 +10701,7 @@ class _EditBillPageState extends State<EditBillPage> {
       return;
     }
     setState(() => selectedBill = null);
-    showSuccessSnack(context, 'Bill $billNo deleted');
+    showSuccessSnack(context, AppMsg.billDeleted(billNo));
   }
 
   void _deleteRow(int index) {
@@ -10835,8 +10715,46 @@ class _EditBillPageState extends State<EditBillPage> {
     if (selectedBill!.rows.isEmpty) {
       showSuccessSnack(
         context,
-        'All lines removed. Delete receipt to remove bill.',
+        AppMsg.allLinesRemoved,
       );
+    }
+  }
+
+  Future<void> _showBillRowOptions(int index) async {
+    if (selectedBill == null) return;
+    if (!_canModifyBill) {
+      _showBillModifyBlockedMessage();
+      return;
+    }
+
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: Text(AppMsg.editNumber),
+              onTap: () => Navigator.pop(ctx, 'edit'),
+            ),
+            ListTile(
+              leading: Icon(Icons.delete_outline, color: Colors.red.shade600),
+              title: Text(
+                AppMsg.deleteLine,
+                style: TextStyle(color: Colors.red.shade600),
+              ),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    if (action == 'edit') {
+      await _editRow(index);
+    } else if (action == 'delete') {
+      _deleteRow(index);
     }
   }
 
@@ -10852,33 +10770,33 @@ class _EditBillPageState extends State<EditBillPage> {
     final countEditController =
         TextEditingController(text: row["count"].toString());
 
-    final bool? ok = await showDialog<bool>(
+    final bool? ok = await showAppDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text("Edit Row"),
+        title: Text(AppMsg.editRowTitle),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             TextField(
               controller: numberEditController,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: "Number"),
+              decoration: InputDecoration(labelText: AppMsg.numberLabel),
             ),
             const SizedBox(height: 10),
             TextField(
               controller: countEditController,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: "Count"),
+              decoration: InputDecoration(labelText: AppMsg.countLabel),
             ),
           ],
         ),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text("Cancel")),
+              child: Text(AppMsg.cancel)),
           ElevatedButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text("Save")),
+              child: Text(AppMsg.save)),
         ],
       ),
     );
@@ -10932,9 +10850,453 @@ class _EditBillPageState extends State<EditBillPage> {
     return bill.drawTimeName;
   }
 
+  String _formatSaleTime(DateTime dt) {
+    final local = dt.toLocal();
+    return "${local.hour.toString().padLeft(2, "0")}:"
+        "${local.minute.toString().padLeft(2, "0")}:"
+        "${local.second.toString().padLeft(2, "0")}";
+  }
+
+  String _billDrawShort(String drawName) {
+    switch (drawName.trim()) {
+      case 'DEAR 1 PM':
+        return '1PM';
+      case 'LSK 3 PM':
+        return '3PM';
+      case 'DEAR 6 PM':
+        return '6PM';
+      case 'DEAR 8 PM':
+        return '8PM';
+      default:
+        return drawName.replaceAll(' ', '');
+    }
+  }
+
+  String _billTicketLabel(String type, String drawName) {
+    final i = type.lastIndexOf('-');
+    final suffix = i >= 0 ? type.substring(i + 1).toUpperCase() : type.toUpperCase();
+    final drawShort = _billDrawShort(drawName);
+    switch (suffix) {
+      case 'SUPER':
+        return 'Super-$drawShort';
+      case 'BOX':
+        return 'Box-$drawShort';
+      case 'A':
+        return 'A-$drawShort';
+      case 'B':
+        return 'B-$drawShort';
+      case 'C':
+        return 'C-$drawShort';
+      case 'AB':
+        return 'AB-$drawShort';
+      case 'BC':
+        return 'BC-$drawShort';
+      case 'AC':
+        return 'AC-$drawShort';
+      default:
+        return type;
+    }
+  }
+
+  String _formatBillFooterAmount(double value) {
+    if ((value - value.roundToDouble()).abs() < 0.001) {
+      return value.round().toString();
+    }
+    return value.toStringAsFixed(1);
+  }
+
+  Widget _billMetaLabelValue(String label, String value,
+      {TextAlign align = TextAlign.start}) {
+    return RichText(
+      textAlign: align,
+      text: TextSpan(
+        style: const TextStyle(fontSize: 14, color: Color(0xFF212121)),
+        children: [
+          TextSpan(text: '$label : '),
+          TextSpan(
+            text: value,
+            style: const TextStyle(fontWeight: FontWeight.w800),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _billDrawDisplayName(String draw) => menuDrawShortLabel(draw);
+
+  Color _billRowDrawColor(BillRecord bill, String rowType) {
+    final code = _drawCodeFromRowType(rowType);
+    if (code != 'ALL') return _salesDrawColor(code);
+    final fromDraw = _drawCodeFromFilter(bill.effectiveDrawName);
+    if (fromDraw.isNotEmpty) return _salesDrawColor(fromDraw);
+    return _drawColorForTime(bill.effectiveDrawName);
+  }
+
+  Color _billFooterDrawColor(BillRecord bill) {
+    final fromDraw = _drawCodeFromFilter(bill.effectiveDrawName);
+    if (fromDraw.isNotEmpty) return _salesDrawColor(fromDraw);
+    if (bill.rows.isNotEmpty) {
+      return _billRowDrawColor(bill, bill.rows.first['type'].toString());
+    }
+    return kAppBlue;
+  }
+
+  Widget _buildBillDetailsView(BillRecord bill) {
+    const tableHeader = Color(0xFF616161);
+    final billNote = bill.billNote;
+
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: kAppBlue,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        surfaceTintColor: Colors.transparent,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: const Text(
+          'Bill Details',
+          style: TextStyle(
+            fontWeight: FontWeight.w600,
+            fontSize: 17,
+          ),
+        ),
+        actions: [
+          if (_canModifyBill)
+            IconButton(
+              icon: const Icon(Icons.delete_outline),
+              onPressed: _deleteBill,
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (bill.modifyBlockMessage(at: _now) != null)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      color: Colors.red.shade50,
+                      child: Text(
+                        bill.modifyBlockMessage(at: _now)!,
+                        style: TextStyle(
+                          color: Colors.red.shade800,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: _billMetaLabelValue(
+                            'Bil NO',
+                            bill.billNo.toString(),
+                          ),
+                        ),
+                        Expanded(
+                          child: _billMetaLabelValue(
+                            'Draw Date',
+                            _formatDate(bill.businessDate),
+                            align: TextAlign.end,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: _billMetaLabelValue(
+                            'Draw',
+                            _billDrawDisplayName(bill.effectiveDrawName),
+                          ),
+                        ),
+                        Expanded(
+                          child: _billMetaLabelValue(
+                            'Sale Time',
+                            _formatSaleTime(bill.createdAt),
+                            align: TextAlign.end,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: _billMetaLabelValue('A', bill.username),
+                        ),
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.centerRight,
+                            child: _billMetaLabelValue(
+                              'Bill Note',
+                              billNote.isNotEmpty ? billNote : '',
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Divider(height: 1, color: Colors.grey.shade300),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+                    child: _billMetaLabelValue('SA', bill.username),
+                  ),
+                  Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade400),
+                    ),
+                    child: Column(
+                      children: [
+                        Container(
+                          color: tableHeader,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 8,
+                          ),
+                          child: const Row(
+                            children: [
+                              Expanded(
+                                flex: 3,
+                                child: Text(
+                                  'Ticket',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                flex: 2,
+                                child: Text(
+                                  'Number',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                flex: 2,
+                                child: Text(
+                                  'Count',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                flex: 2,
+                                child: Text(
+                                  'Amount',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        ...bill.rows.asMap().entries.map((entry) {
+                          final index = entry.key;
+                          final row = entry.value;
+                          final amount =
+                              BillRecord.readRowAmount(row['amount']);
+                          final rowColor = _billRowDrawColor(
+                            bill,
+                            row['type'].toString(),
+                          );
+                          const rowTextStyle = TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          );
+                          return Material(
+                            color: rowColor,
+                            child: InkWell(
+                              onLongPress: () => _showBillRowOptions(index),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  border: Border(
+                                    top: BorderSide(
+                                      color: Colors.white.withValues(alpha: 0.28),
+                                    ),
+                                  ),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 8,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      flex: 3,
+                                      child: Text(
+                                        _billTicketLabel(
+                                          row['type'].toString(),
+                                          bill.effectiveDrawName,
+                                        ),
+                                        style: rowTextStyle,
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 2,
+                                      child: Text(
+                                        row['number'].toString(),
+                                        textAlign: TextAlign.center,
+                                        style: rowTextStyle,
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 2,
+                                      child: Text(
+                                        row['count'].toString(),
+                                        textAlign: TextAlign.center,
+                                        style: rowTextStyle,
+                                      ),
+                                    ),
+                                    Expanded(
+                                      flex: 2,
+                                      child: Text(
+                                        amount.toStringAsFixed(2),
+                                        textAlign: TextAlign.center,
+                                        style: rowTextStyle,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Container(
+            decoration: BoxDecoration(
+              color: _billFooterDrawColor(bill),
+              border: Border(
+                top: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.28),
+                ),
+              ),
+            ),
+            child: SafeArea(
+              top: false,
+              child: SizedBox(
+                height: 56,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            'COUNT',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.white.withValues(alpha: 0.85),
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            bill.totalCount.toString(),
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Container(
+                      width: 1,
+                      height: 36,
+                      color: Colors.white.withValues(alpha: 0.35),
+                    ),
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            'AMOUNT',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.white.withValues(alpha: 0.85),
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            _formatBillFooterAmount(bill.totalAmount),
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final bill = selectedBill;
+
+    if (_directEdit) {
+      if (bill == null) {
+        return Scaffold(
+          appBar: AppBar(
+            title: const Text('Bill Details'),
+          ),
+          body: Center(child: Text(AppMsg.billNotFoundShort)),
+        );
+      }
+      return _buildBillDetailsView(bill);
+    }
+
     final themeColor = _gameColorFromBill(bill);
     final gameName = _gameNameFromBill(bill);
     final modifyBlockMsg = bill?.modifyBlockMessage(at: _now);
@@ -10950,7 +11312,7 @@ class _EditBillPageState extends State<EditBillPage> {
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
                 color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.zero,
                 border: Border.all(color: Colors.grey.shade200),
               ),
               child: Column(
@@ -10999,7 +11361,7 @@ class _EditBillPageState extends State<EditBillPage> {
                 margin: const EdgeInsets.only(bottom: 8),
                 decoration: BoxDecoration(
                   color: Colors.red.shade50,
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.zero,
                   border: Border.all(color: Colors.red.shade200),
                 ),
                 child: Text(
@@ -11015,7 +11377,7 @@ class _EditBillPageState extends State<EditBillPage> {
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
                 color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.zero,
                 border: Border.all(color: Colors.grey.shade200),
               ),
               child: Column(
@@ -11044,6 +11406,17 @@ class _EditBillPageState extends State<EditBillPage> {
                       color: Colors.grey.shade600,
                     ),
                   ),
+                  if (bill.billNote.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      'Bill Note: ${bill.billNote}',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.grey.shade800,
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   Text(
                     'Qty ${bill.totalCount} · Amt ${bill.totalAmount.toStringAsFixed(2)}',
@@ -11065,7 +11438,7 @@ class _EditBillPageState extends State<EditBillPage> {
                 margin: const EdgeInsets.only(bottom: 6),
                 decoration: BoxDecoration(
                   color: Colors.white,
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.zero,
                   border: Border.all(color: Colors.grey.shade200),
                 ),
                 child: ListTile(
@@ -11179,7 +11552,7 @@ class _TicketPageState extends State<TicketPage> {
 
   void _showSalesBlockedMessage() {
     if (!mounted) return;
-    showErrorSnack(context, 'Sales blocked for this user. Contact admin.');
+    showErrorSnack(context, AppMsg.salesBlocked);
   }
 
   bool _ensureCanSell() {
@@ -11199,10 +11572,726 @@ class _TicketPageState extends State<TicketPage> {
   bool get _usesStartEndCountLayout => isRangeMode;
   bool get showThirdField => isTripleMode || isRangeMode;
   static const List<Color> _saveButtonGradient = [
-    Color(0xFF00ACC1),
-    Color(0xFF006064),
+    kAppBlue,
+    kAppBlueDark,
   ];
   static const double _bookingToolbarHeight = 40;
+  static const Color _bookingBarBlue = kAppBlue;
+  static const Color _bookingDearGreen = Color(0xFF43A047);
+  static const Color _bookingBoxPink = Color(0xFFD81B60);
+  static const Color _bookingAllOrange = Color(0xFFEF6C00);
+  static const Color _bookingSegmentAll = Color(0xFFD84315);
+
+  /// Page chrome follows selected draw; action rows keep legacy colors.
+  Color get _bookingPageColor => menuDrawColor(selectedTime);
+
+  Color _bookingDrawButtonColor(String draw) => menuDrawColor(draw);
+
+  @override
+  Widget build(BuildContext context) {
+    final keyboardInset = MediaQuery.viewInsetsOf(context).bottom;
+    return Scaffold(
+      resizeToAvoidBottomInset: false,
+      backgroundColor: Colors.white,
+      body: SafeArea(
+        bottom: false,
+        child: Column(
+          children: [
+            _bookingTopPanel(),
+            Expanded(child: _entriesList()),
+            AnimatedPadding(
+              duration: const Duration(milliseconds: 80),
+              curve: Curves.easeOut,
+              padding: EdgeInsets.only(bottom: keyboardInset),
+              child: _bookingFooterBar(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _bookingTopPanel() {
+    final pageColor = _bookingPageColor;
+    return Container(
+      width: double.infinity,
+      color: pageColor,
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 8),
+      child: Column(
+        children: [
+          if (!_drawBookingOpen)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Container(
+                width: double.infinity,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.red.shade100,
+                  borderRadius: BorderRadius.zero,
+                ),
+                child: Text(
+                  DrawScheduleStore.drawBookingBlockMessage(
+                        selectedTime,
+                        at: _now,
+                      ) ??
+                      AppMsg.bookingClosedFallback,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.red.shade900,
+                  ),
+                ),
+              ),
+            ),
+          _bookingStatsRow(),
+          const SizedBox(height: 6),
+          _bookingDrawDropdown(),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              _patternCheckbox('Any', 'range'),
+              _patternCheckbox('Set', 'set'),
+              _patternCheckbox('100', '100'),
+              _patternCheckbox('111', '111'),
+            ],
+          ),
+          const SizedBox(height: 6),
+          SizedBox(
+            height: 36,
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: numberController,
+                    focusNode: numberFocusNode,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
+                      color: Color(0xFF212121),
+                    ),
+                    keyboardType: TextInputType.number,
+                    textInputAction: TextInputAction.next,
+                    onSubmitted: (_) =>
+                        FocusScope.of(context).requestFocus(countFocusNode),
+                    onChanged: (value) {
+                      setState(() {});
+                      if ((isSingleDigitMode && value.isNotEmpty) ||
+                          (isDoubleDigitMode && value.length >= 2) ||
+                          (isTripleMode && value.length >= 3)) {
+                        FocusScope.of(context).requestFocus(countFocusNode);
+                      }
+                    },
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      if (isSingleDigitMode) LengthLimitingTextInputFormatter(1),
+                      if (isDoubleDigitMode) LengthLimitingTextInputFormatter(2),
+                      if (isTripleMode) LengthLimitingTextInputFormatter(3),
+                    ],
+                    decoration: _bookingInputDecoration(
+                      _usesStartEndCountLayout ? 'Start' : 'Number',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: TextField(
+                    controller: countController,
+                    focusNode: countFocusNode,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
+                      color: Color(0xFF212121),
+                    ),
+                    keyboardType: TextInputType.number,
+                    textInputAction: _usesStartEndCountLayout
+                        ? TextInputAction.next
+                        : TextInputAction.done,
+                    onSubmitted: (_) {
+                      if (_usesStartEndCountLayout) {
+                        FocusScope.of(context).requestFocus(boxFocusNode);
+                      }
+                    },
+                    onChanged: (value) {
+                      setState(() {});
+                      if (_usesStartEndCountLayout && value.length >= 3) {
+                        FocusScope.of(context).requestFocus(boxFocusNode);
+                      }
+                    },
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: _bookingInputDecoration(
+                      _usesStartEndCountLayout ? 'End' : 'Count',
+                    ),
+                  ),
+                ),
+                if (showThirdField) ...[
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: TextField(
+                      controller: boxController,
+                      focusNode: boxFocusNode,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15,
+                        color: Color(0xFF212121),
+                      ),
+                      keyboardType: TextInputType.number,
+                      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                      decoration: _bookingInputDecoration(
+                        _usesStartEndCountLayout ? 'Count' : 'B Count',
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+          _bookingSegmentedActionBar(),
+        ],
+      ),
+    );
+  }
+
+  Widget _bookingStatsRow() {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            'COUNT :${_totalCount()}',
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 15,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(
+            'Rs : ${_totalAmount().toStringAsFixed(1)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 15,
+            ),
+          ),
+        ),
+        _headerDigitBtn('1'),
+        _headerDigitBtn('2'),
+        _headerDigitBtn('3'),
+      ],
+    );
+  }
+
+  Widget _headerDigitBtn(String text) {
+    final bool isSelected = selectedOption == text;
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: InkWell(
+        onTap: () {
+          setState(() {
+            selectedOption = text;
+            if (isSingleDigitMode) {
+              range = false;
+              range2 = false;
+              set = false;
+              n100 = false;
+              n111 = false;
+              if (numberController.text.length > 1) {
+                numberController.text = numberController.text.substring(0, 1);
+              }
+            }
+            if (isDoubleDigitMode && numberController.text.length > 2) {
+              numberController.text = numberController.text.substring(0, 2);
+            }
+            if (isTripleMode && numberController.text.length > 3) {
+              numberController.text = numberController.text.substring(0, 3);
+            }
+            if (!isTripleMode) boxController.clear();
+          });
+        },
+        child: Container(
+          width: 34,
+          height: 34,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: isSelected ? _bookingPageColor : Colors.white,
+            borderRadius: BorderRadius.zero,
+            border: Border.all(
+              color: isSelected ? _bookingPageColor : Colors.white70,
+            ),
+          ),
+          child: Text(
+            text,
+            style: TextStyle(
+              fontWeight: FontWeight.w800,
+              fontSize: 15,
+              color: isSelected ? Colors.white : _bookingPageColor,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openDrawPicker() {
+    final allowed = _allowedDrawsForUser(widget.username);
+    if (allowed.length <= 1) return;
+
+    showAppDialog<void>(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (dialogContext) {
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 28),
+            child: Material(
+              color: Colors.transparent,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (var i = 0; i < allowed.length; i++)
+                    Padding(
+                      padding: EdgeInsets.only(
+                        bottom: i == allowed.length - 1 ? 0 : 8,
+                      ),
+                      child: InkWell(
+                        onTap: () {
+                          setState(() => selectedTime = allowed[i]);
+                          Navigator.pop(dialogContext);
+                        },
+                        child: Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(vertical: 18),
+                          decoration: BoxDecoration(
+                            color: _bookingDrawButtonColor(allowed[i]),
+                            border: Border.all(color: Colors.white, width: 2),
+                            borderRadius: BorderRadius.zero,
+                          ),
+                          child: Text(
+                            _drawDropdownLabel(allowed[i]),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                              fontSize: 18,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _bookingDrawDropdown() {
+    final allowed = _allowedDrawsForUser(widget.username);
+    final drawColor = _bookingDrawButtonColor(selectedTime);
+    final labelStyle = const TextStyle(
+      fontWeight: FontWeight.w800,
+      fontSize: 16,
+      color: Colors.white,
+      letterSpacing: 0.2,
+    );
+
+    if (allowed.length <= 1) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+        decoration: BoxDecoration(
+          color: drawColor,
+          borderRadius: BorderRadius.zero,
+          border: Border.all(color: Colors.white, width: 2),
+        ),
+        child: Text(
+          _drawDropdownLabel(selectedTime),
+          style: labelStyle,
+        ),
+      );
+    }
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: _openDrawPicker,
+        borderRadius: BorderRadius.zero,
+        child: Ink(
+          decoration: BoxDecoration(
+            color: drawColor,
+            borderRadius: BorderRadius.zero,
+            border: Border.all(color: Colors.white, width: 2),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _drawDropdownLabel(selectedTime),
+                    style: labelStyle,
+                  ),
+                ),
+                const Icon(Icons.arrow_drop_down, color: Colors.white, size: 28),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _drawDropdownLabel(String draw) => menuDrawShortLabel(draw);
+
+  InputDecoration _bookingInputDecoration(String hint) {
+    return InputDecoration(
+      hintText: hint,
+      hintStyle: TextStyle(color: Colors.grey.shade500, fontSize: 14),
+      filled: true,
+      fillColor: Colors.white,
+      isDense: true,
+      contentPadding:
+          const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.zero,
+        borderSide: BorderSide(color: Colors.grey.shade300),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.zero,
+        borderSide: const BorderSide(color: Colors.white, width: 1.5),
+      ),
+    );
+  }
+
+  Widget _patternCheckbox(String label, String key) {
+    final bool isSelected = _isPatternSelected(key);
+    final bool disabled = isSingleDigitMode;
+    return Expanded(
+      child: InkWell(
+        onTap: disabled
+            ? null
+            : () => _onExclusiveCheck(key, !isSelected),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Checkbox(
+              value: isSelected,
+              onChanged: disabled
+                  ? null
+                  : (v) => _onExclusiveCheck(key, v ?? false),
+              activeColor: Colors.white,
+              checkColor: _bookingPageColor,
+              side: BorderSide(
+                color: disabled ? Colors.white38 : Colors.white,
+                width: 1.5,
+              ),
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              visualDensity: VisualDensity.compact,
+            ),
+            Flexible(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: disabled ? Colors.white54 : Colors.white,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _entriesList() {
+    if (selectedEntries.isEmpty) {
+      return Center(
+        child: Text(
+          'No entries yet',
+          style: TextStyle(color: Colors.grey.shade500, fontSize: 14),
+        ),
+      );
+    }
+    return ListView.separated(
+      padding: EdgeInsets.zero,
+      itemCount: selectedEntries.length,
+      separatorBuilder: (_, __) => Divider(
+        height: 1,
+        thickness: 1,
+        color: Colors.grey.shade300,
+      ),
+      itemBuilder: (context, index) {
+        final row = selectedEntries[index];
+        final type = row['type'] as String;
+        final rowColor = _rowTypeColor(type);
+        final amount = BillRecord.readRowAmount(row['amount']);
+        final rowStyle = TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.w700,
+          color: rowColor,
+          height: 1.0,
+        );
+
+        return SizedBox(
+          height: 30,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 4,
+                  child: Text(
+                    _rowTypeDisplay(type),
+                    style: rowStyle,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Expanded(
+                  flex: 2,
+                  child: Text(
+                    row['number'] as String,
+                    textAlign: TextAlign.center,
+                    style: rowStyle,
+                  ),
+                ),
+                Expanded(
+                  flex: 2,
+                  child: Text(
+                    row['count'] as String,
+                    textAlign: TextAlign.center,
+                    style: rowStyle,
+                  ),
+                ),
+                Expanded(
+                  flex: 2,
+                  child: Text(
+                    amount.toStringAsFixed(1),
+                    textAlign: TextAlign.center,
+                    style: rowStyle,
+                  ),
+                ),
+                SizedBox(
+                  width: 30,
+                  height: 30,
+                  child: IconButton(
+                    padding: EdgeInsets.zero,
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 30,
+                      minHeight: 30,
+                    ),
+                    onPressed: _drawBookingOpen
+                        ? () => setState(() => selectedEntries.removeAt(index))
+                        : _showDrawClosedMessage,
+                    icon: Icon(
+                      Icons.delete_outline,
+                      color: Colors.grey.shade500,
+                      size: 20,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _bookingFooterBar() {
+    final canSave = selectedEntries.isNotEmpty &&
+        _drawBookingOpen &&
+        !_salesBlocked;
+    final pageColor = _bookingPageColor;
+
+    return Material(
+      color: const Color(0xFFF0F2F5),
+      elevation: 3,
+      shadowColor: Colors.black45,
+      child: SizedBox(
+        height: 44,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(4, 4, 6, 4),
+          child: Row(
+            children: [
+              _bookingFooterIcon(
+                icon: Icons.arrow_back,
+                onPressed: () => Navigator.pop(context),
+                iconColor: pageColor,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: _bookingColorButton(
+                  label: 'DELETE',
+                  color: const Color(0xFFCC0000),
+                  onPressed: () {
+                    if (!_drawBookingOpen) {
+                      _showDrawClosedMessage();
+                      return;
+                    }
+                    setState(() {
+                      numberController.clear();
+                      countController.clear();
+                      boxController.clear();
+                      selectedEntries.clear();
+                    });
+                  },
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: _bookingColorButton(
+                  label: 'WHATSAPP',
+                  color: const Color(0xFF25D366),
+                  onPressed: _importEntriesFromClipboard,
+                ),
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: _bookingColorButton(
+                  label: 'SAVE',
+                  color: canSave ? pageColor : const Color(0xFF90A4AE),
+                  onPressed: canSave ? _saveCurrentBooking : null,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bookingColorButton({
+    required String label,
+    required Color color,
+    required VoidCallback? onPressed,
+  }) {
+    return Material(
+      color: color,
+      borderRadius: BorderRadius.zero,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onPressed,
+        child: SizedBox(
+          height: double.infinity,
+          child: Center(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w800,
+                fontSize: 12,
+                letterSpacing: 0.4,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bookingFooterIcon({
+    IconData? icon,
+    required VoidCallback onPressed,
+    Widget? child,
+    Color iconColor = Colors.white,
+  }) {
+    return SizedBox(
+      width: 40,
+      height: 36,
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        splashRadius: 20,
+        onPressed: onPressed,
+        icon: child ??
+            Icon(
+              icon,
+              color: iconColor,
+              size: 24,
+            ),
+      ),
+    );
+  }
+
+  String _drawActionLabel(String time) {
+    switch (time.trim()) {
+      case 'DEAR 1 PM':
+        return '1 PM';
+      case 'DEAR 6 PM':
+        return '6 PM';
+      case 'DEAR 8 PM':
+        return '8 PM';
+      case 'LSK 3 PM':
+        return '3 PM';
+      default:
+        return time;
+    }
+  }
+
+  String _actionBtnLabel(String text) {
+    if (text == 'BOTH' || text == 'ALL') return 'ALL';
+    final suffix = _actionBtnSuffix(text);
+    final drawLabel = _drawActionLabel(selectedTime);
+    if (suffix == 'SUPER') return '$drawLabel DEAR';
+    if (suffix == 'BOX') return '$drawLabel BOX';
+    return suffix;
+  }
+
+  String _rowTypeSuffix(String type) {
+    final i = type.lastIndexOf('-');
+    return i >= 0 ? type.substring(i + 1) : type;
+  }
+
+  String _rowDrawLetter(String draw) {
+    if (draw.startsWith('LSK')) return 'L';
+    return 'D';
+  }
+
+  int _rowDrawHour(String draw) {
+    switch (draw.trim()) {
+      case 'DEAR 1 PM':
+        return 1;
+      case 'DEAR 6 PM':
+        return 6;
+      case 'DEAR 8 PM':
+        return 8;
+      case 'LSK 3 PM':
+        return 3;
+      default:
+        return 1;
+    }
+  }
+
+  String _rowTypeDisplay(String type) {
+    final suffix = _rowTypeSuffix(type);
+    final drawLabel = _drawActionLabel(selectedTime);
+    if (suffix == 'SUPER') return '$drawLabel DEAR';
+    if (suffix == 'BOX') return '$drawLabel BOX';
+    final letter = _rowDrawLetter(selectedTime);
+    final hour = _rowDrawHour(selectedTime);
+    return '$letter-$suffix-$hour';
+  }
+
+  Color _rowTypeColor(String type) {
+    final suffix = _rowTypeSuffix(type);
+    if (suffix == 'BOX' || suffix == 'B' || suffix == 'AC') {
+      return _bookingBoxPink;
+    }
+    if (suffix == 'SUPER' || suffix == 'A' || suffix == 'AB') {
+      return _bookingDearGreen;
+    }
+    if (suffix == 'C' || suffix == 'BC') {
+      return _bookingAllOrange;
+    }
+    return _bookingAllOrange;
+  }
 
   @override
   void initState() {
@@ -11240,593 +12329,6 @@ class _TicketPageState extends State<TicketPage> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      resizeToAvoidBottomInset: false,
-      body: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: SingleChildScrollView(
-                child: Column(
-                  children: [_topPanel(), _listPanel()],
-                ),
-              ),
-            ),
-            _bottomSummary(),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _topPanel() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border.all(color: Colors.grey.shade300),
-      ),
-      child: Column(
-        children: [
-          if (!_drawBookingOpen) ...[
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              margin: const EdgeInsets.only(bottom: 8),
-              decoration: BoxDecoration(
-                color: Colors.red.shade50,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.red.shade200),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.lock_clock, size: 18, color: Colors.red.shade700),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      DrawScheduleStore.drawBookingBlockMessage(
-                            selectedTime,
-                            at: _now,
-                          ) ??
-                          'Booking closed',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                        color: Colors.red.shade800,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-          Row(
-            children: [
-              Expanded(
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      _compactSelectBox("1"),
-                      _compactSelectBox("2"),
-                      _compactSelectBox("3"),
-                      const SizedBox(width: 6),
-                      _closeCountdownBadge(),
-                      const SizedBox(width: 6),
-                      _bookingDrawSelector(),
-                      const SizedBox(width: 6),
-                      SizedBox(
-                        width: 96,
-                        height: _bookingToolbarHeight,
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              colors: selectedEntries.isNotEmpty
-                                  ? _saveButtonGradient
-                                  : const [
-                                      Color(0xFF9E9E9E),
-                                      Color(0xFF757575)
-                                    ],
-                            ),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: ElevatedButton(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.transparent,
-                              shadowColor: Colors.transparent,
-                              foregroundColor: Colors.white,
-                              padding: EdgeInsets.zero,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                            ),
-                            onPressed: selectedEntries.isNotEmpty &&
-                                    _drawBookingOpen &&
-                                    !_salesBlocked
-                                ? _saveCurrentBooking
-                                : null,
-                            child: const Text(
-                              "SAVE",
-                              style: TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 13,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                SizedBox(
-                  width: 118,
-                  child: DropdownButtonFormField<String>(
-                    value: _selectedRangePattern,
-                    isDense: true,
-                    isExpanded: true,
-                    decoration: _bookingFieldDecoration('Pattern'),
-                    items: const [
-                      DropdownMenuItem(value: 'none', child: Text('None')),
-                      DropdownMenuItem(value: 'range', child: Text('Range')),
-                      DropdownMenuItem(
-                          value: 'range2', child: Text('Range 2')),
-                    ],
-                    onChanged:
-                        isSingleDigitMode ? null : _onRangePatternChanged,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                _compactOptionBox('Set Box', 'set'),
-                const SizedBox(width: 6),
-                _compactOptionBox('100', '100'),
-                const SizedBox(width: 6),
-                _compactOptionBox('111', '111'),
-                const SizedBox(width: 6),
-                SizedBox(
-                  width: 148,
-                  child: TextField(
-                    controller: customerNameController,
-                    textCapitalization: TextCapitalization.words,
-                    style: const TextStyle(fontSize: 14),
-                    decoration: _bookingFieldDecoration('Customer'),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 6),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: numberController,
-                  focusNode: numberFocusNode,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w500,
-                    fontSize: 17,
-                  ),
-                  keyboardType: TextInputType.number,
-                  textInputAction: TextInputAction.next,
-                  onSubmitted: (_) =>
-                      FocusScope.of(context).requestFocus(countFocusNode),
-                  onChanged: (value) {
-                    setState(() {});
-                    if ((isSingleDigitMode && value.isNotEmpty) ||
-                        (isDoubleDigitMode && value.length >= 2) ||
-                        (isTripleMode && value.length >= 3)) {
-                      FocusScope.of(context).requestFocus(countFocusNode);
-                    }
-                  },
-                  inputFormatters: [
-                    FilteringTextInputFormatter.digitsOnly,
-                    if (isSingleDigitMode) LengthLimitingTextInputFormatter(1),
-                    if (isDoubleDigitMode) LengthLimitingTextInputFormatter(2),
-                    if (isTripleMode) LengthLimitingTextInputFormatter(3),
-                  ],
-                  decoration: InputDecoration(
-                    labelText: _usesStartEndCountLayout ? "Start" : "Number",
-                    filled: false,
-                    enabledBorder: OutlineInputBorder(
-                      borderSide: BorderSide(
-                        color: Colors.grey.shade400,
-                        width: 1.0,
-                      ),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderSide: BorderSide(
-                        color: Colors.grey.shade500,
-                        width: 1.3,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: TextField(
-                  controller: countController,
-                  focusNode: countFocusNode,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w500,
-                    fontSize: 17,
-                  ),
-                  keyboardType: TextInputType.number,
-                  textInputAction: _usesStartEndCountLayout
-                      ? TextInputAction.next
-                      : TextInputAction.done,
-                  onSubmitted: (_) {
-                    if (_usesStartEndCountLayout) {
-                      FocusScope.of(context).requestFocus(boxFocusNode);
-                    }
-                  },
-                  onChanged: (value) {
-                    setState(() {});
-                    if (_usesStartEndCountLayout && value.length >= 3) {
-                      FocusScope.of(context).requestFocus(boxFocusNode);
-                    }
-                  },
-                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                  decoration: InputDecoration(
-                    labelText: _usesStartEndCountLayout ? "End" : "Count",
-                    filled: false,
-                    enabledBorder: OutlineInputBorder(
-                      borderSide: BorderSide(
-                        color: Colors.grey.shade400,
-                        width: 1.0,
-                      ),
-                    ),
-                    focusedBorder: OutlineInputBorder(
-                      borderSide: BorderSide(
-                        color: Colors.grey.shade500,
-                        width: 1.3,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              if (showThirdField) ...[
-                const SizedBox(width: 10),
-                Expanded(
-                  child: TextField(
-                    controller: boxController,
-                    focusNode: boxFocusNode,
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w500,
-                      fontSize: 17,
-                    ),
-                    keyboardType: TextInputType.number,
-                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                    decoration: InputDecoration(
-                      labelText: _usesStartEndCountLayout ? "Count" : "Box",
-                      filled: false,
-                      enabledBorder: OutlineInputBorder(
-                        borderSide: BorderSide(
-                          color: Colors.grey.shade400,
-                          width: 1.0,
-                        ),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderSide: BorderSide(
-                          color: Colors.grey.shade500,
-                          width: 1.3,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: _modeButtons().map((label) {
-              return Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.only(right: 6),
-                  child: actionBtn(label),
-                ),
-              );
-            }).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _listPanel() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border.all(color: Colors.grey.shade300),
-      ),
-      child: Column(
-        children: [
-          Container(
-            color: Colors.green.shade100,
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text("Count: ${_totalCount()}",
-                    style: const TextStyle(fontWeight: FontWeight.w700)),
-                Text("Total: ${_totalAmount().toStringAsFixed(2)}",
-                    style: const TextStyle(fontWeight: FontWeight.w700)),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(6, 6, 6, 4),
-            child: Row(
-              children: [
-                const Expanded(
-                  flex: 3,
-                  child: Text('Type',
-                      style: TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w600)),
-                ),
-                const Expanded(
-                  flex: 2,
-                  child: Text('No',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w600)),
-                ),
-                const Expanded(
-                  flex: 1,
-                  child: Text('Cnt',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w600)),
-                ),
-                const Expanded(
-                  flex: 2,
-                  child: Text('Rate',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w600)),
-                ),
-                const Expanded(
-                  flex: 2,
-                  child: Text('Amt',
-                      textAlign: TextAlign.end,
-                      style: TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w600)),
-                ),
-                const SizedBox(width: 36),
-              ],
-            ),
-          ),
-          ...selectedEntries.asMap().entries.map((entry) {
-            final int index = entry.key;
-            final row = entry.value;
-            final bool isMathy =
-                isRangeMode || (row["type"] as String).contains("BOX");
-            final rate = _rowRateFromMap(row);
-            final amount = BillRecord.readRowAmount(row['amount']);
-
-            return Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
-              decoration: BoxDecoration(
-                  border:
-                      Border(bottom: BorderSide(color: Colors.grey.shade300))),
-              child: Row(
-                children: [
-                  Expanded(
-                      flex: 3,
-                      child: Text(
-                        row["type"] as String,
-                        style: const TextStyle(fontSize: 13),
-                        overflow: TextOverflow.ellipsis,
-                      )),
-                  Expanded(
-                      flex: 2,
-                      child: Text(
-                        row["number"] as String,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontFamily: isMathy ? 'monospace' : null,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 15,
-                        ),
-                      )),
-                  Expanded(
-                      flex: 1,
-                      child: Text(
-                        row["count"] as String,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontFamily: isMathy ? 'monospace' : null,
-                          fontWeight: FontWeight.w500,
-                          fontSize: 14,
-                        ),
-                      )),
-                  Expanded(
-                      flex: 2,
-                      child: Text(
-                        _formatBookingRate(rate),
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontWeight: FontWeight.w600,
-                          fontSize: 14,
-                          color: Colors.green.shade700,
-                        ),
-                      )),
-                  Expanded(
-                      flex: 2,
-                      child: Text(
-                        amount.toStringAsFixed(2),
-                        textAlign: TextAlign.end,
-                        style: const TextStyle(fontWeight: FontWeight.w600),
-                      )),
-                  IconButton(
-                    onPressed: _drawBookingOpen
-                        ? () => setState(() => selectedEntries.removeAt(index))
-                        : _showDrawClosedMessage,
-                    icon: const Icon(Icons.delete, color: Colors.red, size: 20),
-                  ),
-                ],
-              ),
-            );
-          }),
-        ],
-      ),
-    );
-  }
-
-  Widget _bottomSummary() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      color: Colors.white,
-      child: Column(
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text("Commition: ${_commission().toStringAsFixed(2)}",
-                  style: const TextStyle(
-                      fontSize: 18, fontWeight: FontWeight.w700)),
-              Text("Total Collect: ${_totalAmount().toStringAsFixed(2)}",
-                  style: const TextStyle(
-                      fontSize: 18, fontWeight: FontWeight.w700)),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(child: bottomBtn("CLEAR", Colors.grey)),
-              const SizedBox(width: 8),
-              Expanded(child: bottomBtn("Home", Colors.red)),
-              const SizedBox(width: 8),
-              Expanded(child: bottomBtn("Message", Colors.teal)),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _compactSelectBox(String text) {
-    final bool isSelected = selectedOption == text;
-    final Color gameColor = _timeColor(selectedTime);
-    return Padding(
-      padding: const EdgeInsets.only(right: 4),
-      child: SizedBox(
-        height: _bookingToolbarHeight,
-        child: InkWell(
-          onTap: () {
-            setState(() {
-              selectedOption = text;
-              if (isSingleDigitMode) {
-                range = false;
-                range2 = false;
-                set = false;
-                n100 = false;
-                n111 = false;
-                if (numberController.text.length > 1) {
-                  numberController.text = numberController.text.substring(0, 1);
-                }
-              }
-              if (isDoubleDigitMode && numberController.text.length > 2) {
-                numberController.text = numberController.text.substring(0, 2);
-              }
-              if (isTripleMode && numberController.text.length > 3) {
-                numberController.text = numberController.text.substring(0, 3);
-              }
-              if (!isTripleMode) boxController.clear();
-            });
-          },
-          child: Center(
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
-                  color: gameColor,
-                  size: 22,
-                ),
-                const SizedBox(width: 2),
-                Text(text, style: const TextStyle(fontSize: 13)),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget selectBox(String text) {
-    final bool isSelected = selectedOption == text;
-    final Color gameColor = _timeColor(selectedTime);
-    return Padding(
-      padding: const EdgeInsets.only(right: 8),
-      child: InkWell(
-        onTap: () {
-          setState(() {
-            selectedOption = text;
-            if (isSingleDigitMode) {
-              range = false;
-              range2 = false;
-              set = false;
-              n100 = false;
-              n111 = false;
-              if (numberController.text.length > 1) {
-                numberController.text = numberController.text.substring(0, 1);
-              }
-            }
-            if (isDoubleDigitMode && numberController.text.length > 2) {
-              numberController.text = numberController.text.substring(0, 2);
-            }
-            if (isTripleMode && numberController.text.length > 3) {
-              numberController.text = numberController.text.substring(0, 3);
-            }
-            if (!isTripleMode) boxController.clear();
-          });
-        },
-        child: Row(
-          children: [
-            Icon(
-              isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
-              color: gameColor,
-              size: 26,
-            ),
-            const SizedBox(width: 4),
-            Text(text),
-          ],
-        ),
-      ),
-    );
-  }
-
-  InputDecoration _bookingFieldDecoration(String label) {
-    return InputDecoration(
-      labelText: label,
-      filled: false,
-      isDense: true,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-      enabledBorder: OutlineInputBorder(
-        borderSide: BorderSide(color: Colors.grey.shade400, width: 1.0),
-      ),
-      focusedBorder: OutlineInputBorder(
-        borderSide: BorderSide(color: Colors.grey.shade500, width: 1.3),
-      ),
-    );
-  }
-
   String get _selectedRangePattern {
     if (range2) return 'range2';
     if (range) return 'range';
@@ -11852,18 +12354,16 @@ class _TicketPageState extends State<TicketPage> {
     final bool isSelected = _isPatternSelected(key);
     final bool disabled = isSingleDigitMode;
     final Color gameColor = _timeColor(selectedTime);
-    final List<Color> gameGradient = _timeGradient(selectedTime);
     return InkWell(
       onTap: disabled ? null : () => _onExclusiveCheck(key, !isSelected),
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.zero,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
         decoration: BoxDecoration(
-          gradient: isSelected ? LinearGradient(colors: gameGradient) : null,
-          color: isSelected ? null : Colors.white,
+          color: isSelected ? gameColor : Colors.white,
           border:
               Border.all(color: isSelected ? gameColor : Colors.grey.shade400),
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.zero,
         ),
         child: Text(
           label,
@@ -11934,35 +12434,207 @@ class _TicketPageState extends State<TicketPage> {
   }
 
   BoxDecoration _actionBtnDecoration(String text) {
-    if (text == 'BOTH') {
+    if (text == 'BOTH' || text == 'ALL') {
       return BoxDecoration(
-        color: kBookingBothBtnColor,
-        borderRadius: BorderRadius.circular(8),
+        color: _bookingAllOrange,
+        borderRadius: BorderRadius.zero,
       );
     }
     if (text.endsWith('-SUPER')) {
       return BoxDecoration(
-        color: kBookingSuperBtnColor,
-        borderRadius: BorderRadius.circular(8),
+        color: _bookingDearGreen,
+        borderRadius: BorderRadius.zero,
       );
     }
     if (text.endsWith('-BOX')) {
       return BoxDecoration(
-        color: kBookingBoxBtnColor,
-        borderRadius: BorderRadius.circular(8),
+        color: _bookingBoxPink,
+        borderRadius: BorderRadius.zero,
       );
     }
     final digitColor = _digitOptionBtnColor(text);
     if (digitColor != null) {
       return BoxDecoration(
         color: digitColor,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.zero,
       );
     }
     return BoxDecoration(
-      gradient: LinearGradient(colors: _timeGradient(selectedTime)),
-      borderRadius: BorderRadius.circular(8),
+      color: kAppBlue,
+      borderRadius: BorderRadius.zero,
     );
+  }
+
+  Widget _bookingSegmentedActionBar() {
+    final buttons = _modeButtons();
+    return Container(
+      height: 38,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.zero,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.25),
+            offset: const Offset(0, 2),
+            blurRadius: 2,
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.zero,
+        child: Row(
+          children: [
+            for (var i = 0; i < buttons.length; i++)
+              Expanded(
+                child: _segmentActionBtn(
+                  buttons[i],
+                  showLeftDivider: i > 0,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _segmentActionBtn(String text, {required bool showLeftDivider}) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: _segmentBtnColor(text),
+        border: showLeftDivider
+            ? Border(
+                left: BorderSide(
+                  color: Colors.black.withValues(alpha: 0.22),
+                  width: 1,
+                ),
+              )
+            : null,
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () => _onActionButtonPressed(text),
+          child: SizedBox(
+            height: 38,
+            child: Center(
+              child: Text(
+                _segmentBtnLabel(text),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 13,
+                  letterSpacing: 0.1,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _segmentBtnLabel(String actionKey) {
+    if (actionKey == 'ALL' || actionKey == 'BOTH') return 'ALL';
+    final suffix = _actionBtnSuffix(actionKey);
+    if (suffix == 'SUPER') return '${_drawActionLabel(selectedTime)} DEAR';
+    if (suffix == 'BOX') return '${_drawActionLabel(selectedTime)} BOX';
+    final letter = _rowDrawLetter(selectedTime);
+    final hour = _rowDrawHour(selectedTime);
+    return '$letter-$suffix-$hour';
+  }
+
+  Color _segmentBtnColor(String actionKey) {
+    if (actionKey == 'ALL' || actionKey == 'BOTH') return _bookingSegmentAll;
+    final suffix = _actionBtnSuffix(actionKey);
+    if (suffix == 'SUPER' || suffix == 'A' || suffix == 'AB') {
+      return _bookingDearGreen;
+    }
+    if (suffix == 'BOX' || suffix == 'B' || suffix == 'AC') {
+      return _bookingBoxPink;
+    }
+    if (suffix == 'C' || suffix == 'BC') return _bookingAllOrange;
+    return _bookingAllOrange;
+  }
+
+  void _onActionButtonPressed(String text) {
+    if (!_drawBookingOpen) {
+      _showDrawClosedMessage();
+      return;
+    }
+    if (!_ensureCanSell()) return;
+    final String inputNumber = numberController.text.trim();
+    final String inputSecond = countController.text.trim();
+    final String inputThird = boxController.text.trim();
+    if (inputNumber.isEmpty || inputSecond.isEmpty) return;
+    final bool isSimpleTriple = isTripleHundredDefault &&
+        inputThird.isEmpty &&
+        inputNumber.length == 3;
+    final bool isSplitSuperBoxMode =
+        isTripleMode && !isRangeMode && !isSimpleTriple;
+
+    if (_usesStartEndCountLayout && !isSimpleTriple && inputThird.isEmpty) {
+      return;
+    }
+
+    final int superCountInput = int.tryParse(inputSecond) ?? 0;
+    final int boxCountInput = int.tryParse(inputThird) ?? 0;
+
+    if (isSplitSuperBoxMode) {
+      if (superCountInput <= 0) return;
+      if ((text == "BOTH" || text.endsWith("-BOX")) && boxCountInput <= 0) {
+        return;
+      }
+    }
+
+    final int countVal = isSimpleTriple
+        ? (int.tryParse(inputSecond) ?? 0)
+        : (_usesStartEndCountLayout
+            ? (int.tryParse(inputThird) ?? 0)
+            : (int.tryParse(inputSecond) ?? 0));
+    if (countVal <= 0) return;
+
+    final List<String> types = _expandActionTypes(text);
+    final List<String> numbers =
+        isSimpleTriple ? [inputNumber.padLeft(3, "0")] : _expandNumbers();
+    if (numbers.isEmpty) return;
+
+    var pendingCount = 0;
+    var pendingAmount = 0.0;
+    final List<Map<String, dynamic>> pendingRows = [];
+    for (final type in types) {
+      for (final n in numbers) {
+        int rowCount = countVal;
+        if (isSplitSuperBoxMode) {
+          if (type.endsWith("-SUPER")) {
+            rowCount = superCountInput;
+          } else if (type.endsWith("-BOX")) {
+            rowCount = boxCountInput > 0 ? boxCountInput : superCountInput;
+          } else {
+            rowCount = superCountInput;
+          }
+        }
+        if (rowCount <= 0) continue;
+        final double amount = _rowAmountForType(type, rowCount);
+        pendingCount += rowCount;
+        pendingAmount += amount;
+        pendingRows.add(_bookingRow(type, n, rowCount));
+      }
+    }
+    if (pendingRows.isEmpty) return;
+    if (!_validateUserLimits(
+        addCount: pendingCount, addAmount: pendingAmount)) {
+      return;
+    }
+
+    setState(() {
+      for (final row in pendingRows.reversed) {
+        selectedEntries.insert(0, row);
+      }
+      numberController.clear();
+      countController.clear();
+      boxController.clear();
+    });
+    FocusScope.of(context).requestFocus(numberFocusNode);
   }
 
   Widget actionBtn(String text) {
@@ -11974,120 +12646,44 @@ class _TicketPageState extends State<TicketPage> {
           shadowColor: Colors.transparent,
           foregroundColor:
               _actionBtnUsesDarkText(text) ? const Color(0xFF212121) : Colors.white,
-          padding: const EdgeInsets.symmetric(vertical: 14),
+          padding: EdgeInsets.zero,
+          minimumSize: const Size(0, 38),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         ),
-        onPressed: () {
-          if (!_drawBookingOpen) {
-            _showDrawClosedMessage();
-            return;
-          }
-          if (!_ensureCanSell()) return;
-          final String inputNumber = numberController.text.trim();
-          final String inputSecond = countController.text.trim();
-          final String inputThird = boxController.text.trim();
-          if (inputNumber.isEmpty || inputSecond.isEmpty) return;
-          final bool isSimpleTriple = isTripleHundredDefault &&
-              inputThird.isEmpty &&
-              inputNumber.length == 3;
-          final bool isSplitSuperBoxMode =
-              isTripleMode && !isRangeMode && !isSimpleTriple;
-
-          if (_usesStartEndCountLayout &&
-              !isSimpleTriple &&
-              inputThird.isEmpty) {
-            return;
-          }
-
-          final int superCountInput = int.tryParse(inputSecond) ?? 0;
-          final int boxCountInput = int.tryParse(inputThird) ?? 0;
-
-          // Trial rule requested:
-          // In triple booking, Count -> SUPER and Box field -> BOX count.
-          if (isSplitSuperBoxMode) {
-            if (superCountInput <= 0) return;
-            if ((text == "BOTH" || text.endsWith("-BOX")) &&
-                boxCountInput <= 0) {
-              return;
-            }
-          }
-
-          final int countVal = isSimpleTriple
-              ? (int.tryParse(inputSecond) ?? 0)
-              : (_usesStartEndCountLayout
-                  ? (int.tryParse(inputThird) ?? 0)
-                  : (int.tryParse(inputSecond) ?? 0));
-          if (countVal <= 0) return;
-
-          final List<String> types = _expandActionTypes(text);
-          final List<String> numbers =
-              isSimpleTriple ? [inputNumber.padLeft(3, "0")] : _expandNumbers();
-          if (numbers.isEmpty) return;
-
-          var pendingCount = 0;
-          var pendingAmount = 0.0;
-          final List<Map<String, dynamic>> pendingRows = [];
-          for (final type in types) {
-            for (final n in numbers) {
-              int rowCount = countVal;
-              if (isSplitSuperBoxMode) {
-                if (type.endsWith("-SUPER")) {
-                  rowCount = superCountInput;
-                } else if (type.endsWith("-BOX")) {
-                  rowCount =
-                      boxCountInput > 0 ? boxCountInput : superCountInput;
-                } else {
-                  rowCount = superCountInput;
-                }
-              }
-              if (rowCount <= 0) continue;
-              final double amount = _rowAmountForType(type, rowCount);
-              pendingCount += rowCount;
-              pendingAmount += amount;
-              pendingRows.add(_bookingRow(type, n, rowCount));
-            }
-          }
-          if (pendingRows.isEmpty) return;
-          if (!_validateUserLimits(
-              addCount: pendingCount, addAmount: pendingAmount)) {
-            return;
-          }
-
-          setState(() {
-            for (final row in pendingRows.reversed) {
-              selectedEntries.insert(0, row);
-            }
-            numberController.clear();
-            countController.clear();
-            boxController.clear();
-          });
-          FocusScope.of(context).requestFocus(numberFocusNode);
-        },
-        child: Text(text),
+        onPressed: () => _onActionButtonPressed(text),
+        child: Text(
+          _actionBtnLabel(text),
+          style: const TextStyle(
+            fontWeight: FontWeight.w800,
+            fontSize: 13,
+            letterSpacing: 0.2,
+          ),
+        ),
       ),
     );
   }
 
   Widget bottomBtn(String text, Color color) {
     final String key = text.toUpperCase();
-    final List<Color> gradient;
+    final Color btnColor;
     switch (key) {
       case "CLEAR":
-        gradient = const [Color(0xFF90A4AE), Color(0xFF546E7A)];
+        btnColor = const Color(0xFF546E7A);
         break;
       case "HOME":
-        gradient = const [Color(0xFFEF5350), Color(0xFFC62828)];
+        btnColor = const Color(0xFFC62828);
         break;
       case "MESSAGE":
-        gradient = const [Color(0xFF4DB6AC), Color(0xFF00695C)];
+        btnColor = const Color(0xFF00695C);
         break;
       default:
-        gradient = [color, color];
+        btnColor = color;
     }
 
     return DecoratedBox(
       decoration: BoxDecoration(
-        gradient: LinearGradient(colors: gradient),
-        borderRadius: BorderRadius.circular(8),
+        color: btnColor,
+        borderRadius: BorderRadius.zero,
       ),
       child: ElevatedButton(
         style: ElevatedButton.styleFrom(
@@ -12095,7 +12691,7 @@ class _TicketPageState extends State<TicketPage> {
           shadowColor: Colors.transparent,
           foregroundColor: Colors.white,
           padding: const EdgeInsets.symmetric(vertical: 14),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         ),
         onPressed: () {
           if (key == "CLEAR") {
@@ -12124,7 +12720,7 @@ class _TicketPageState extends State<TicketPage> {
     final code = _timeCode();
     if (selectedOption == "1") return ["$code-A", "$code-B", "$code-C", "ALL"];
     if (selectedOption == "2") {
-      return ["$code-AB", "$code-BC", "$code-AC", "ALL"];
+      return ["$code-AB", "$code-AC", "$code-BC", "ALL"];
     }
     return ["$code-SUPER", "$code-BOX", "BOTH"];
   }
@@ -12139,7 +12735,7 @@ class _TicketPageState extends State<TicketPage> {
     final String raw = (data?.text ?? "").trim();
     if (raw.isEmpty) {
       if (!mounted) return;
-      showErrorSnack(context, 'Clipboard-ൽ data ഇല്ല');
+      showErrorSnack(context, AppMsg.clipboardEmpty);
       return;
     }
 
@@ -12182,7 +12778,7 @@ class _TicketPageState extends State<TicketPage> {
     final List<Map<String, dynamic>> rows = _parseClipboardRows(raw);
     if (rows.isEmpty) {
       if (!mounted) return;
-      showErrorSnack(context, 'Number/Count format മനസ്സിലായില്ല');
+      showErrorSnack(context, AppMsg.clipboardFormatError);
       return;
     }
 
@@ -12199,7 +12795,7 @@ class _TicketPageState extends State<TicketPage> {
     });
 
     if (!mounted) return;
-    showSuccessSnack(context, '${rows.length} entries add ചെയ്തു');
+    showSuccessSnack(context, AppMsg.entriesAdded(rows.length));
   }
 
   String _inferImportMode(String cleanedText) {
@@ -13220,8 +13816,7 @@ class _TicketPageState extends State<TicketPage> {
     if (digitLimit > 0 && modeTotal > digitLimit) {
       showErrorSnack(
         context,
-        '$selectedOption-digit count limit exceeded '
-        '(max $digitLimit · used $modeTotal)',
+        AppMsg.digitLimitExceeded(selectedOption, digitLimit, modeTotal),
       );
       return false;
     }
@@ -13232,9 +13827,7 @@ class _TicketPageState extends State<TicketPage> {
       if (amountTotal > user.amountLimit) {
         showErrorSnack(
           context,
-          'Amount limit exceeded '
-          '(max ${user.amountLimit.toStringAsFixed(0)} · '
-          'used ${amountTotal.toStringAsFixed(0)})',
+          AppMsg.amountLimitExceeded(user.amountLimit, amountTotal),
         );
         return false;
       }
@@ -13255,7 +13848,7 @@ class _TicketPageState extends State<TicketPage> {
       if (!_schemeAllowsDraw(selectedTime)) {
         showErrorSnack(
           context,
-          'Scheme ${user.scheme} does not allow booking for $selectedTime',
+          AppMsg.schemeDrawNotAllowed(user.scheme, selectedTime),
         );
         return false;
       }
@@ -13266,9 +13859,7 @@ class _TicketPageState extends State<TicketPage> {
       if (amountTotal > user.amountLimit) {
         showErrorSnack(
           context,
-          'Amount limit exceeded '
-          '(max ${user.amountLimit.toStringAsFixed(0)} · '
-          'used ${amountTotal.toStringAsFixed(0)})',
+          AppMsg.amountLimitExceeded(user.amountLimit, amountTotal),
         );
         return false;
       }
@@ -13282,7 +13873,7 @@ class _TicketPageState extends State<TicketPage> {
       if (modeTotal > limit) {
         showErrorSnack(
           context,
-          '$mode-digit count limit exceeded (max $limit · used $modeTotal)',
+          AppMsg.digitLimitExceeded(mode, limit, modeTotal),
         );
         return false;
       }
@@ -13305,9 +13896,9 @@ class _TicketPageState extends State<TicketPage> {
 
   double _commission() => 0.0;
 
-  Color _timeColor(String time) => _drawColorForTime(time);
+  Color _timeColor(String time) => menuDrawColor(time);
 
-  List<Color> _timeGradient(String time) => _drawGradientForTime(time);
+  List<Color> _timeGradient(String time) => kAppBlueGradient;
 
   List<Color> _liveTimeLightGradient(String time) =>
       _drawLightGradientForTime(time);
@@ -13333,12 +13924,8 @@ class _TicketPageState extends State<TicketPage> {
         height: _bookingToolbarHeight,
         padding: const EdgeInsets.symmetric(horizontal: 10),
         decoration: BoxDecoration(
-          gradient: LinearGradient(
-            colors: gradient,
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-          borderRadius: BorderRadius.circular(18),
+          color: gradient.first,
+          borderRadius: BorderRadius.zero,
           border: Border.all(color: borderColor, width: 1),
         ),
         child: closeCountdown != null
@@ -13381,7 +13968,6 @@ class _TicketPageState extends State<TicketPage> {
   }
 
   Widget _bookingDrawSelector() {
-    final gradient = _timeGradient(selectedTime);
     final allowed = _allowedDrawsForUser(widget.username);
     final label = _shortDrawLabel(selectedTime);
 
@@ -13390,8 +13976,8 @@ class _TicketPageState extends State<TicketPage> {
         height: _bookingToolbarHeight,
         child: DecoratedBox(
           decoration: BoxDecoration(
-            gradient: LinearGradient(colors: gradient),
-            borderRadius: BorderRadius.circular(8),
+            color: kAppBlue,
+            borderRadius: BorderRadius.zero,
           ),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -13498,19 +14084,47 @@ class _TicketPageState extends State<TicketPage> {
     });
 
     if (mounted) {
-      showSuccessSnack(context, '${bookings.length} entries imported');
+      showSuccessSnack(context, AppMsg.entriesImported(bookings.length));
     }
 
     if (autoSubmit) {
-      _saveCurrentBooking();
+      _saveCurrentBooking(skipConfirm: true);
     }
     return true;
   }
 
-  void _saveCurrentBooking() {
+  String _formatConfirmAmount(double value) {
+    if ((value - value.roundToDouble()).abs() < 0.001) {
+      return value.round().toString();
+    }
+    return value.toStringAsFixed(1);
+  }
+
+  Future<bool> _showSaveConfirmDialog() async {
+    final nameResult = await showAppDialog<String?>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => _SaveConfirmDialog(
+        initialName: customerNameController.text.trim(),
+        totalCount: _totalCount(),
+        totalAmount: _formatConfirmAmount(_totalAmount()),
+      ),
+    );
+    if (nameResult == null) return false;
+    customerNameController.text = nameResult;
+    return true;
+  }
+
+  Future<void> _saveCurrentBooking({bool skipConfirm = false}) async {
     if (selectedEntries.isEmpty) return;
     if (!_ensureCanSell()) return;
     if (!_validateBillForSave()) return;
+
+    if (!skipConfirm) {
+      FocusScope.of(context).unfocus();
+      final confirmed = await _showSaveConfirmDialog();
+      if (!confirmed || !mounted) return;
+    }
 
     final bookedAt = _now.toLocal();
     final businessDay =
@@ -13531,7 +14145,6 @@ class _TicketPageState extends State<TicketPage> {
     }
 
     final int billNo = 400000 + Random().nextInt(99999);
-    final Color gameColor = _timeColor(selectedTime);
     final billRows =
         selectedEntries.map((e) => Map<String, dynamic>.from(e)).toList();
     BillsStore.add(
@@ -13546,57 +14159,83 @@ class _TicketPageState extends State<TicketPage> {
       ),
     );
 
-    showDialog<void>(
+    FocusScope.of(context).unfocus();
+    showAppDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
-        return Dialog(
-          backgroundColor: Colors.white,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [gameColor, gameColor.withValues(alpha: 0.75)],
-                  ),
-                ),
-                padding: const EdgeInsets.symmetric(vertical: 18),
-                child: const Text(
-                  "😎  Success",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w700),
-                ),
-              ),
-              const SizedBox(height: 36),
-              Text("Bill No $billNo", style: const TextStyle(fontSize: 15)),
-              const SizedBox(height: 36),
-              Row(
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 28),
+            child: Material(
+              color: Colors.transparent,
+              elevation: 8,
+              borderRadius: BorderRadius.zero,
+              clipBehavior: Clip.antiAlias,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Expanded(
-                    child: SizedBox(
-                      height: 52,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            colors: [
-                              gameColor,
-                              gameColor.withValues(alpha: 0.75)
-                            ],
+                  Container(
+                    width: double.infinity,
+                    color: _bookingPageColor,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 12,
+                    ),
+                    child: Row(
+                      children: [
+                        const Text('😊', style: TextStyle(fontSize: 22)),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            AppMsg.billSavedTitle,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
                         ),
-                        child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.transparent,
-                            shadowColor: Colors.transparent,
-                            foregroundColor: Colors.white,
-                            shape: const RoundedRectangleBorder(
-                                borderRadius: BorderRadius.zero),
+                      ],
+                    ),
+                  ),
+                  Container(
+                    width: double.infinity,
+                    color: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 28,
+                    ),
+                    child: Text(
+                      AppMsg.billNo(billNo),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w800,
+                        color: _bookingPageColor,
+                      ),
+                    ),
+                  ),
+                  Container(
+                    width: double.infinity,
+                    color: _bookingPageColor,
+                    padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(dialogContext),
+                          child: Text(
+                            AppMsg.close,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                              letterSpacing: 0.3,
+                            ),
                           ),
+                        ),
+                        TextButton(
                           onPressed: () {
                             Navigator.pop(dialogContext);
                             Navigator.push(
@@ -13606,29 +14245,22 @@ class _TicketPageState extends State<TicketPage> {
                               ),
                             );
                           },
-                          child: const Text("View Bill"),
+                          child: Text(
+                            AppMsg.viewBill,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  ),
-                  Expanded(
-                    child: SizedBox(
-                      height: 52,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.grey,
-                          foregroundColor: Colors.white,
-                          shape: const RoundedRectangleBorder(
-                              borderRadius: BorderRadius.zero),
-                        ),
-                        onPressed: () => Navigator.pop(dialogContext),
-                        child: const Text("OK"),
-                      ),
+                      ],
                     ),
                   ),
                 ],
               ),
-            ],
+            ),
           ),
         );
       },
@@ -13642,5 +14274,174 @@ class _TicketPageState extends State<TicketPage> {
       customerNameController.clear();
     });
     FocusScope.of(context).requestFocus(numberFocusNode);
+  }
+}
+
+class _SaveConfirmDialog extends StatefulWidget {
+  final String initialName;
+  final int totalCount;
+  final String totalAmount;
+
+  const _SaveConfirmDialog({
+    required this.initialName,
+    required this.totalCount,
+    required this.totalAmount,
+  });
+
+  @override
+  State<_SaveConfirmDialog> createState() => _SaveConfirmDialogState();
+}
+
+class _SaveConfirmDialogState extends State<_SaveConfirmDialog> {
+  late final TextEditingController _nameController;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameController = TextEditingController(text: widget.initialName);
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final width = MediaQuery.sizeOf(context).width;
+    return MediaQuery(
+      data: MediaQuery.of(context).copyWith(viewInsets: EdgeInsets.zero),
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            width: width - 48,
+            margin: const EdgeInsets.only(top: 52),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.zero,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.22),
+                  blurRadius: 16,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(22, 20, 22, 0),
+                  child: Text(
+                    AppMsg.confirmTitle,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 18,
+                      color: Color(0xFF212121),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(22, 14, 22, 0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        AppMsg.confirmSaveBill,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          color: Color(0xFF424242),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Text(
+                        AppMsg.totalCount(widget.totalCount),
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        AppMsg.totalAmount(widget.totalAmount),
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                      TextField(
+                        controller: _nameController,
+                        autofocus: true,
+                        textCapitalization: TextCapitalization.words,
+                        scrollPadding: EdgeInsets.zero,
+                        style: const TextStyle(
+                          color: Color(0xFF212121),
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        cursorColor: const Color(0xFF1976D2),
+                        decoration: InputDecoration(
+                          labelText: AppMsg.billNote,
+                          labelStyle: TextStyle(color: Colors.grey.shade700),
+                          isDense: true,
+                          filled: true,
+                          fillColor: Colors.white,
+                          contentPadding:
+                              const EdgeInsets.symmetric(vertical: 10),
+                          enabledBorder: UnderlineInputBorder(
+                            borderSide:
+                                BorderSide(color: Colors.grey.shade500),
+                          ),
+                          focusedBorder: const UnderlineInputBorder(
+                            borderSide: BorderSide(
+                              color: Color(0xFF1976D2),
+                              width: 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 10),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: Text(
+                          AppMsg.cancel,
+                          style: const TextStyle(
+                            color: Color(0xFF1976D2),
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () =>
+                            Navigator.pop(context, _nameController.text.trim()),
+                        child: Text(
+                          AppMsg.ok,
+                          style: const TextStyle(
+                            color: Color(0xFF1976D2),
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }

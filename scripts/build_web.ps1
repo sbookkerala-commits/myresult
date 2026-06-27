@@ -4,7 +4,7 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
 
 Write-Host "Building Flutter web (release)..."
-flutter build web --release
+flutter build web --release --no-wasm-dry-run
 
 $src = Join-Path $root "build\web"
 $dest = Join-Path $root "server\public"

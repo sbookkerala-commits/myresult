@@ -5,6 +5,8 @@ import 'package:http/http.dart' as http;
 
 import '../kerala_compliment_rules.dart';
 import 'fetched_result_data.dart';
+import 'ist_clock.dart';
+import 'result_fetch_service.dart';
 
 class KeralaParsedResult {
   final DateTime date;
@@ -129,10 +131,16 @@ class KeralaResultFetcher {
     final ninthFlat = KeralaComplimentRules.filterNinthGridNumbers(
       _fourDigitsFromText(_stripTags(ninthSec)),
     );
-    final ninthComplete = KeralaComplimentRules.ninthIsComplete(
+    var ninthComplete = KeralaComplimentRules.ninthIsComplete(
       ninthFlat,
       declared,
     );
+    if (!ninthComplete &&
+        declared != null &&
+        ninthFlat.length >= declared - 1 &&
+        ninthFlat.length >= KeralaComplimentRules.complimentCount) {
+      ninthComplete = true;
+    }
 
     List<String> compliments = List<String>.filled(
       KeralaComplimentRules.complimentCount,
@@ -226,7 +234,26 @@ class KeralaAutoResultService {
   KeralaAutoResultService._();
   static final KeralaAutoResultService instance = KeralaAutoResultService._();
 
-  static const _stableWatch = Duration(minutes: 1);
+  static const _stableWatch = Duration(seconds: 20);
+
+  bool _shouldSaveComplimentsNow({
+    required KeralaParsedResult parsed,
+    required List<String> compliments,
+    required bool userTriggered,
+  }) {
+    if (!parsed.ninthComplete || !parsed.complimentsValid) return false;
+    if (userTriggered) return true;
+    final ist = IstClock.now();
+    if (!ResultFetchService.isInLiveWindow('LSK3', ist) &&
+        !ResultFetchService.isInFullResultPush('LSK3', ist)) {
+      debugPrint('KERALA_AUTO_COMPLIMENTS_SAVE outside live window');
+      return true;
+    }
+    return _ninthWatchAllowsComplimentSave(
+      compliments,
+      userTriggered: false,
+    );
+  }
 
   List<String>? _watchingCompliments;
   DateTime? _watchStartedAt;
@@ -288,32 +315,37 @@ class KeralaAutoResultService {
     final fetched = KeralaResultFetcher.toFetchedData(parsed);
     if (fetched == null) return false;
 
-    var saveCompliments = false;
-    if (parsed.ninthComplete && parsed.complimentsValid) {
-      saveCompliments = _ninthWatchAllowsComplimentSave(
-        fetched.compliments,
-        userTriggered: userTriggered,
-      );
-    } else {
-      resetWatch();
-    }
+    final saveCompliments = _shouldSaveComplimentsNow(
+      parsed: parsed,
+      compliments: fetched.compliments,
+      userTriggered: userTriggered,
+    );
 
     if (!saveCompliments) {
-      final partial = FetchedResultData(
-        drawCode: 'LSK3',
-        date: fetched.date,
-        prizes: fetched.prizes,
-        compliments: List<String>.filled(
-          KeralaComplimentRules.complimentCount,
-          '---',
+      if (parsed.ninthComplete && parsed.complimentsValid) {
+        resetWatch();
+      }
+      final hasPrize = fetched.prizes.any(_isValidCell);
+      if (!hasPrize) return false;
+      debugPrint(
+        'KERALA_AUTO_PARTIAL prizes=$hasPrize compliments=skip '
+        'ninth=${parsed.ninthScrapedCount}/${parsed.declaredNinthCount ?? "?"}',
+      );
+      await onSave(
+        FetchedResultData(
+          drawCode: fetched.drawCode,
+          date: fetched.date,
+          prizes: fetched.prizes,
+          compliments: List<String>.filled(
+            KeralaComplimentRules.complimentCount,
+            '---',
+          ),
         ),
       );
-      final hasPrize = partial.prizes.any(_isValidCell);
-      if (!hasPrize) return false;
-      await onSave(partial);
       return true;
     }
 
+    debugPrint('KERALA_AUTO_COMPLIMENTS_SAVE complete');
     await onSave(fetched);
     resetWatch();
     return true;

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'database/local_database.dart';
+import 'app_messages.dart';
 
 const List<String> kDrawTimeNames = [
   'DEAR 1 PM',
@@ -384,9 +385,10 @@ class DrawScheduleStore {
   static String? drawBookingBlockMessage(String drawTime, {DateTime? at}) {
     if (isDrawBookingOpen(drawTime, at: at)) return null;
     final s = scheduleFor(drawTime);
-    return 'Booking closed · Open '
-        '${formatDrawScheduleTime(s.openHour, s.openMinute)} – '
-        '${formatDrawScheduleTime(s.closeHour, s.closeMinute)}';
+    return AppMsg.bookingClosed(
+      formatDrawScheduleTime(s.openHour, s.openMinute),
+      formatDrawScheduleTime(s.closeHour, s.closeMinute),
+    );
   }
 
   static String drawTimeFromRowType(String type) {
@@ -435,10 +437,10 @@ class DrawScheduleStore {
     );
     final expectedDay = businessDateForDraw(drawTime, at: now);
     if (billDay != expectedDay) {
-      return 'Cannot edit or delete past draw receipts';
+      return AppMsg.pastDrawReceiptBlocked;
     }
     return drawBookingBlockMessage(drawTime, at: now) ??
-        'Booking closed — edit and delete are not allowed';
+        AppMsg.bookingClosedEditBlocked;
   }
 
   static Future<void> saveNow() async {

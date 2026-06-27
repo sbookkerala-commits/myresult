@@ -18,18 +18,35 @@ WEEKLY LOTTERY
 5thPrize Amount
 ''';
 
+  const sample6pmDotIn = '''
+0001
+0814
+2022
+25424  27314  37994  38114  49916
+0036    0301    0750    1960    2694
+26/06/26
+0275    0906    2568    3458    3627
+4722    4755    5092    6311    6551
+87G 86392
+CROWN FRIDAY
+WEEKLY LOTTERY
+''';
+
   test('parses 1pm PDF text', () {
     final day = DateTime(2026, 6, 22);
     final data = DearFastResultSource.parseDearPdfText('DEAR1', day, sample1pm);
     expect(data, isNotNull);
-    final joined = sample1pm.replaceAll('\n', ' ');
-    final matches = RegExp(r'(\d{1,2}[A-Z])\s+(\d{5})')
-        .allMatches(joined)
-        .map((m) => m.group(0))
-        .toList();
-    expect(matches, contains('49L 80432'));
     expect(data!.prizes, ['432', '834', '369', '832', '065']);
     expect(data.compliments.first, '014');
+    expect(DearFastResultSource.hasFullResult(data), isTrue);
+  });
+
+  test('parses dearlottery.in 6pm PDF layout without sold by', () {
+    final day = DateTime(2026, 6, 26);
+    final data = DearFastResultSource.parseDearPdfText('DEAR6', day, sample6pmDotIn);
+    expect(data, isNotNull);
+    expect(data!.prizes.take(3), ['392', '424', '036']);
+    expect(data.compliments.where((c) => c != '---').length, greaterThanOrEqualTo(3));
     expect(DearFastResultSource.hasFullResult(data), isTrue);
   });
 

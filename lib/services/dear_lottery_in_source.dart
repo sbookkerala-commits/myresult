@@ -6,6 +6,7 @@ import 'package:syncfusion_flutter_pdf/pdf.dart';
 
 import 'dear_fast_result_source.dart';
 import 'fetched_result_data.dart';
+import 'ist_clock.dart';
 
 /// Dear results via [dear-lottery.in] — publication gate + official PDF numbers.
 ///
@@ -161,7 +162,7 @@ class DearLotteryInSource {
   ) async {
     final code = drawCode.trim().toUpperCase();
     final target = DateTime(day.year, day.month, day.day);
-    final today = DateTime(now.year, now.month, now.day);
+    final today = IstClock.calendarDay(at: now);
     final yesterday = today.subtract(const Duration(days: 1));
 
     if (_sameCalendarDay(target, today)) {
@@ -171,14 +172,24 @@ class DearLotteryInSource {
       if (page == null) return null;
       final title = page['title']?['rendered']?.toString() ?? '';
       final pageDay = parsePageDate(title);
+      final html = page['content']?['rendered']?.toString();
       if (pageDay == null || !_sameCalendarDay(pageDay, target)) {
+        final imageUrl = html == null
+            ? null
+            : extractResultImageUrl(html, drawLabel: _drawLabel(code));
+        if (imageUrl == null || !imageUrl.contains('dear-lottery.in')) {
+          debugPrint(
+            'DearLotteryInSource: today page date mismatch for $code '
+            '(expected $target, title="$title")',
+          );
+          return null;
+        }
         debugPrint(
-          'DearLotteryInSource: today page date mismatch for $code '
-          '(expected $target, title="$title")',
+          'DearLotteryInSource: using chart for $code despite title date $pageDay',
         );
-        return null;
+        return html;
       }
-      return page['content']?['rendered']?.toString();
+      return html;
     }
 
     if (_sameCalendarDay(target, yesterday)) {
@@ -210,23 +221,38 @@ class DearLotteryInSource {
   ) async {
     final fileCode = _pdfFileCode(drawCode);
     if (fileCode == null) return null;
-    final fileName = _pdfFileName(day, fileCode);
-    final uri = Uri.parse('$_nagalandPdfBase/$fileName');
-    try {
-      final res = await http.get(uri).timeout(const Duration(seconds: 25));
-      if (res.statusCode != 200 || res.bodyBytes.length < 4096) return null;
-      if (!_looksLikePdf(res.bodyBytes)) return null;
-      PdfDocument? document;
+    final target = DateTime(day.year, day.month, day.day);
+    for (final offset in const [0, -1, 1]) {
+      final tryDay = target.add(Duration(days: offset));
+      final fileName = _pdfFileName(tryDay, fileCode);
+      final uri = Uri.parse('$_nagalandPdfBase/$fileName');
       try {
-        document = PdfDocument(inputBytes: res.bodyBytes);
-        return PdfTextExtractor(document).extractText();
-      } finally {
-        document?.dispose();
+        final res = await http.get(uri).timeout(const Duration(seconds: 25));
+        if (res.statusCode != 200 || res.bodyBytes.length < 1024) continue;
+        if (!_looksLikePdf(res.bodyBytes)) continue;
+        PdfDocument? document;
+        try {
+          document = PdfDocument(inputBytes: res.bodyBytes);
+          final text = PdfTextExtractor(document).extractText();
+          final parsed = DearFastResultSource.parseOfficialPdfText(
+            drawCode,
+            target,
+            text,
+          );
+          if (parsed != null) {
+            debugPrint(
+              'DearLotteryInSource: PDF $fileName matched day $target',
+            );
+            return text;
+          }
+        } finally {
+          document?.dispose();
+        }
+      } catch (e) {
+        debugPrint('DearLotteryInSource._fetchNagalandPdfText $fileName: $e');
       }
-    } catch (e) {
-      debugPrint('DearLotteryInSource._fetchNagalandPdfText $drawCode: $e');
-      return null;
     }
+    return null;
   }
 
   static bool _looksLikePdf(List<int> bytes) {

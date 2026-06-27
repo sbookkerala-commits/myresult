@@ -101,4 +101,29 @@ router.post('/', authRequired, async (req, res) => {
   }
 });
 
+router.delete('/:drawCode/:date', authRequired, async (req, res) => {
+  try {
+    const drawCode = (req.params.drawCode || '').trim().toUpperCase();
+    const day = startOfDay(new Date(req.params.date));
+    if (!drawCode) {
+      return res.status(400).json({ error: 'drawCode required' });
+    }
+
+    await Result.findOneAndUpdate(
+      { drawCode, date: day },
+      {
+        $set: {
+          deletedAt: new Date(),
+          updatedBy: req.user.username,
+        },
+      },
+    );
+
+    res.json({ ok: true, drawCode, date: day });
+  } catch (e) {
+    console.error('DELETE result', e);
+    res.status(500).json({ error: 'Failed to delete result' });
+  }
+});
+
 module.exports = router;

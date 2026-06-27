@@ -1,6 +1,6 @@
 import '../database/local_database.dart';
 
-enum QueueOp { booking, bookingDelete, sale, result, settings, users }
+enum QueueOp { booking, bookingDelete, sale, result, resultDelete, settings, users }
 
 class OfflineQueue {
   static Future<void> enqueue(QueueOp op, Map<String, dynamic> payload) async {

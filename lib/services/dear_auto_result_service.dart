@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import 'ist_clock.dart';
 import 'result_fetch_service.dart';
 
 /// Dear hybrid auto: admin manual 1st prize, website auto 2nd–5th + compliments.
@@ -19,12 +20,7 @@ class DearAutoResultService {
       dearDrawCodes.contains(drawCode.trim().toUpperCase());
 
   /// Current clock in India (IST), independent of device timezone.
-  static DateTime nowInIndia({DateTime? at}) {
-    final ist = (at ?? DateTime.now())
-        .toUtc()
-        .add(const Duration(hours: 5, minutes: 30));
-    return DateTime(ist.year, ist.month, ist.day, ist.hour, ist.minute, ist.second);
-  }
+  static DateTime nowInIndia({DateTime? at}) => IstClock.now(at: at);
 
   /// Dear auto fetch allowed after 1 PM / 6 PM / 8 PM IST on draw day.
   static bool isAtOrAfterAutoCheck(String drawCode, {DateTime? at}) {

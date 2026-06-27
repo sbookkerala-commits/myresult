@@ -15,7 +15,9 @@
 # Keep our app classes if needed, though usually not necessary for standard Flutter apps
 -keep class com.example.myresult.** { *; }
 
-# Obfuscate strings (Note: ProGuard doesn't do deep string encryption, but we can rename classes/methods)
+# Syncfusion PDF (Dear result parse in release)
+-keep class com.syncfusion.** { *; }
+-dontwarn com.syncfusion.**
 -repackageclasses ''
 -allowaccessmodification
 -overloadaggressively
