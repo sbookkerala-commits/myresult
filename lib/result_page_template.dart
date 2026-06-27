@@ -620,6 +620,7 @@ class ResultShareCaptureCard extends StatelessWidget {
     required this.timeLabel,
     required this.dateLabel,
     required this.bookingWhatsappPhone,
+    this.showBookingWhatsappBar = true,
     required this.prizes,
     required this.compliments,
   });
@@ -629,6 +630,7 @@ class ResultShareCaptureCard extends StatelessWidget {
   final String timeLabel;
   final String dateLabel;
   final String bookingWhatsappPhone;
+  final bool showBookingWhatsappBar;
   final List<String> prizes;
   final List<String> compliments;
 
@@ -652,13 +654,14 @@ class ResultShareCaptureCard extends StatelessWidget {
             const searchBtnH = 34.0;
             const titleBarH = 44.0;
 
+            final bookingBarH =
+                showBookingWhatsappBar ? titleBarH + gapAfterTitle : 0.0;
             final topSectionH = topPad +
                 searchRowH +
                 gapAfterSearch +
                 searchBtnH +
                 gapAfterButton +
-                titleBarH +
-                gapAfterTitle;
+                bookingBarH;
             final contentH =
                 (constraints.maxHeight - topSectionH).clamp(0.0, double.infinity);
             final prizeH = contentH * _prizeFraction;
@@ -684,10 +687,12 @@ class ResultShareCaptureCard extends StatelessWidget {
                   child: ResultWinningNumbersSearchButton(onPressed: null),
                 ),
                 const SizedBox(height: gapAfterButton),
-                ResultResultsTitleBar(
-                  bookingWhatsappPhone: bookingWhatsappPhone,
-                ),
-                const SizedBox(height: gapAfterTitle),
+                if (showBookingWhatsappBar) ...[
+                  ResultResultsTitleBar(
+                    bookingWhatsappPhone: bookingWhatsappPhone,
+                  ),
+                  const SizedBox(height: gapAfterTitle),
+                ],
                 SizedBox(
                   height: prizeH,
                   child: Column(

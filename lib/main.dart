@@ -4748,8 +4748,7 @@ Future<void> showBookingWhatsappPhoneEditor(BuildContext context) async {
   }
 }
 
-String _bookingWhatsappPhoneForViewer(String phone) =>
-    AppSession.role == 'ADMIN' ? phone.trim() : '';
+bool get _showBookingWhatsappRow => AppSession.role == 'ADMIN';
 
 const List<DropdownMenuItem<String>> _winningGroupItems = [
   DropdownMenuItem(value: "Select", child: Text("All")),
@@ -7366,17 +7365,18 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
                 dateLabel: resultDateFieldLabel(widget.resultDate),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              child: ValueListenableBuilder<String>(
-                valueListenable: BookingContactStore.whatsappPhone,
-                builder: (context, phone, _) {
-                  return ResultResultsTitleBar(
-                    bookingWhatsappPhone: _bookingWhatsappPhoneForViewer(phone),
-                  );
-                },
+            if (_showBookingWhatsappRow)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: ValueListenableBuilder<String>(
+                  valueListenable: BookingContactStore.whatsappPhone,
+                  builder: (context, phone, _) {
+                    return ResultResultsTitleBar(
+                      bookingWhatsappPhone: phone,
+                    );
+                  },
+                ),
               ),
-            ),
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -7823,9 +7823,8 @@ class _DearResultPageState extends State<DearResultPage> {
       height: cardHeight,
       timeLabel: resultDrawCompactTime(_selectedDraw),
       dateLabel: resultDateFieldLabel(_resultDate),
-      bookingWhatsappPhone: _bookingWhatsappPhoneForViewer(
-        BookingContactStore.whatsappPhone.value,
-      ),
+      bookingWhatsappPhone: BookingContactStore.whatsappPhone.value,
+      showBookingWhatsappBar: _showBookingWhatsappRow,
       prizes: List<String>.from(_prizeValues),
       compliments: List<String>.from(_complimentValues),
     );
@@ -8141,15 +8140,17 @@ class _DearResultPageState extends State<DearResultPage> {
               ),
             ),
             const SizedBox(height: 10),
-            ValueListenableBuilder<String>(
-              valueListenable: BookingContactStore.whatsappPhone,
-              builder: (context, phone, _) {
-                return ResultResultsTitleBar(
-                  bookingWhatsappPhone: _bookingWhatsappPhoneForViewer(phone),
-                );
-              },
-            ),
-            const SizedBox(height: 4),
+            if (_showBookingWhatsappRow) ...[
+              ValueListenableBuilder<String>(
+                valueListenable: BookingContactStore.whatsappPhone,
+                builder: (context, phone, _) {
+                  return ResultResultsTitleBar(
+                    bookingWhatsappPhone: phone,
+                  );
+                },
+              ),
+              const SizedBox(height: 4),
+            ],
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
