@@ -50,6 +50,62 @@ WEEKLY LOTTERY
     expect(DearFastResultSource.hasFullResult(data), isTrue);
   });
 
+  test('parses dearlottery.in new PDF layout with 5th lines before Sold by', () {
+    const sampleJun27 = '''
+0060
+1213
+1948
+3064
+4148
+4677
+5596
+6919
+8173
+8939
+0213
+1244
+1978
+3387
+4238
+4837
+5761
+6973
+8193
+8978
+0252
+1312
+2030
+3676
+4256
+4987
+6031
+7269
+8213
+8985
+9999
+8888
+7777
+Sold by : SELLER
+02563  06043  06497  09082  11021
+42545  51242  65718  67153  93603
+0957    2127    2523    2547    3558
+3982    5452    6227    8353    9990
+27/06/26
+0273    0309    1995    2469    2907
+5362    6102    7562    8474    9077
+96D 67938
+WEEKLY LOTTERY
+''';
+    final day = DateTime(2026, 6, 27);
+    final data = DearFastResultSource.parseDearPdfText('DEAR1', day, sampleJun27);
+    expect(data, isNotNull);
+    expect(data!.prizes[0], '938');
+    expect(data.compliments.first, '030');
+    expect(data.compliments, isNot(contains('777')));
+    expect(data.compliments, isNot(contains('888')));
+    expect(DearFastResultSource.hasFullResult(data), isTrue);
+  });
+
   test('rejects PDF when draw date does not match', () {
     final day = DateTime(2026, 6, 23);
     final data = DearFastResultSource.parseDearPdfText('DEAR8', day, sample1pm);

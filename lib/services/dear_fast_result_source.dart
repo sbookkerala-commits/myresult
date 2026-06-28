@@ -74,6 +74,32 @@ class DearFastResultSource {
 
   static List<String> _emptyCompliments() => List<String>.filled(30, '---');
 
+  /// Old PDF: long digit lines before Sold by. New PDF (Jun 2026+): 100×4-digit
+  /// 5th-prize lines — compliments = first 30 only, not all 100 sorted.
+  static List<String> dearComplimentSourceNumbers(
+    List<String> raw, {
+    required bool fromLongGrid,
+  }) {
+    if (raw.isEmpty) return const [];
+    if (fromLongGrid || raw.length <= 30) return raw;
+    return raw.take(30).toList();
+  }
+
+  static List<String> complimentsFromNumbers(
+    List<String> raw, {
+    required bool fromLongGrid,
+  }) {
+    final source = dearComplimentSourceNumbers(raw, fromLongGrid: fromLongGrid);
+    if (source.isEmpty) return _emptyCompliments();
+    return _sortedCompliments(source.map(_last3).toList());
+  }
+
+  /// API `prizes.5th` — first 30 published numbers → 30 compliment cells.
+  static List<String> complimentsFromApiFifth(List<String> fifth) {
+    if (fifth.isEmpty) return _emptyCompliments();
+    return complimentsFromNumbers(fifth, fromLongGrid: false);
+  }
+
   static FetchedResultData _partialFirstPrize(
     String drawCode,
     DateTime day,
@@ -266,12 +292,16 @@ class DearFastResultSource {
     }
 
     final fifthRaw = <String>[];
+    var fromLongGrid = false;
     for (var i = 0; i < soldIdx; i++) {
       final line = lines[i].replaceAll(RegExp(r'\s+'), '');
       if (RegExp(r'^\d{40,}$').hasMatch(line)) {
+        fromLongGrid = true;
         for (var j = 0; j + 4 <= line.length; j += 4) {
           fifthRaw.add(line.substring(j, j + 4));
         }
+      } else if (RegExp(r'^\d{4}$').hasMatch(line)) {
+        fifthRaw.add(line);
       }
     }
 
@@ -327,6 +357,7 @@ class DearFastResultSource {
       thirdNums: thirdNums,
       fourthNums: fourthNums,
       fifthRaw: fifthRaw,
+      complimentsFromLongGrid: fromLongGrid,
     );
   }
 
@@ -345,11 +376,20 @@ class DearFastResultSource {
     }
 
     final fifthRaw = <String>[];
+    var fromLongGrid = false;
     final fiveDigitLines = <String>[];
     final fourDigitLines = <String>[];
 
     for (var i = 0; i < firstLineIdx; i++) {
-      final line = lines[i];
+      final rawLine = lines[i];
+      final line = rawLine.replaceAll(RegExp(r'\s+'), '');
+      if (RegExp(r'^\d{40,}$').hasMatch(line)) {
+        fromLongGrid = true;
+        for (var j = 0; j + 4 <= line.length; j += 4) {
+          fifthRaw.add(line.substring(j, j + 4));
+        }
+        continue;
+      }
       if (RegExp(r'^\d{4}$').hasMatch(line)) {
         fifthRaw.add(line);
         continue;
@@ -357,15 +397,15 @@ class DearFastResultSource {
       if (RegExp(r'^\d{2}/\d{2}/\d{2}$').hasMatch(line)) continue;
 
       final nums = RegExp(r'\d{4,5}')
-          .allMatches(line)
+          .allMatches(rawLine)
           .map((m) => m.group(0)!)
           .toList();
       if (nums.isEmpty) continue;
 
       if (nums.every((n) => n.length == 5)) {
-        fiveDigitLines.add(line);
+        fiveDigitLines.add(rawLine);
       } else if (nums.every((n) => n.length == 4)) {
-        fourDigitLines.add(line);
+        fourDigitLines.add(rawLine);
       }
     }
 
@@ -387,6 +427,7 @@ class DearFastResultSource {
       thirdNums: thirdNums,
       fourthNums: fourthNums,
       fifthRaw: fifthRaw,
+      complimentsFromLongGrid: fromLongGrid,
     );
   }
 
@@ -398,6 +439,7 @@ class DearFastResultSource {
     required List<String> thirdNums,
     required List<String> fourthNums,
     required List<String> fifthRaw,
+    bool complimentsFromLongGrid = true,
   }) {
     final prizes = _emptyPrizes();
     prizes[0] = firstPrize;
@@ -406,8 +448,9 @@ class DearFastResultSource {
     if (fourthNums.isNotEmpty) prizes[3] = _last3(fourthNums.first);
     prizes[4] = _dearFifthPrizeDisplay(fourthNums, fifthRaw);
 
-    final compliments = _sortedCompliments(
-      fifthRaw.map(_last3).toList(),
+    final compliments = complimentsFromNumbers(
+      fifthRaw,
+      fromLongGrid: complimentsFromLongGrid,
     );
 
     return FetchedResultData(

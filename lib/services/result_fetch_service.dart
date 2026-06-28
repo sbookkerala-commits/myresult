@@ -313,29 +313,9 @@ class ResultFetchService {
     return '---';
   }
 
-  /// Consolation (Cons.) grid — not 5th prize. API `prizes.cons` or long digit lines.
-  static List<String> _dearComplimentsFromCons(List<String> cons) {
-    final raw = <String>[];
-    for (final entry in cons) {
-      final compact = entry.replaceAll(RegExp(r'\s+'), '');
-      if (RegExp(r'^\d{40,}$').hasMatch(compact)) {
-        for (var j = 0; j + 4 <= compact.length; j += 4) {
-          raw.add(_last3(compact.substring(j, j + 4)));
-        }
-        continue;
-      }
-      final d = _digitsOnly(entry);
-      if (d.length == 4) {
-        raw.add(_last3(entry));
-      } else if (d.length == 3) {
-        raw.add(d.padLeft(3, '0'));
-      }
-    }
-    if (raw.length < 3) {
-      return List<String>.filled(30, '---');
-    }
-    return _sortedCompliments(raw);
-  }
+  /// Dear compliments: first 30 numbers from API `prizes.5th` (last 3 digits each).
+  static List<String> _dearComplimentsFromApiFifth(List<String> fifth) =>
+      DearFastResultSource.complimentsFromApiFifth(fifth);
 
   static bool _dearHasCompliments(FetchedResultData data) =>
       data.compliments.any(_isValidCell);
@@ -424,10 +404,6 @@ class ResultFetchService {
     final third = _stringList(p['3rd']);
     final fourth = _stringList(p['4th']);
     final fifth = _stringList(p['5th']);
-    final cons = [
-      ..._stringList(p['cons']),
-      ..._stringList(json['cons']),
-    ];
 
     final prizes = [
       firstPrize,
@@ -437,7 +413,7 @@ class ResultFetchService {
       _dearFifthPrizeDisplay(fourth, fifth),
     ];
 
-    final compliments = _dearComplimentsFromCons(cons);
+    final compliments = _dearComplimentsFromApiFifth(fifth);
 
     return FetchedResultData(
       drawCode: drawCode.trim().toUpperCase(),
