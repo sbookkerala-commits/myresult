@@ -6953,7 +6953,9 @@ List<String> _sortedComplimentsColumnMajor(List<String> raw) {
     if (item.trim().isEmpty || item.trim() == '---') continue;
     final digits = item.replaceAll(RegExp(r'[^0-9]'), '');
     if (digits.isEmpty) continue;
-    final n = int.tryParse(digits.length > 3 ? digits.substring(0, 3) : digits);
+    final n = int.tryParse(
+      digits.length > 3 ? digits.substring(digits.length - 3) : digits,
+    );
     if (n != null) numbers.add(n);
   }
   numbers.sort();

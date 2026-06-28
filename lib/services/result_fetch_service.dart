@@ -313,6 +313,78 @@ class ResultFetchService {
     return '---';
   }
 
+  /// Consolation (Cons.) grid — not 5th prize. API `prizes.cons` or long digit lines.
+  static List<String> _dearComplimentsFromCons(List<String> cons) {
+    final raw = <String>[];
+    for (final entry in cons) {
+      final compact = entry.replaceAll(RegExp(r'\s+'), '');
+      if (RegExp(r'^\d{40,}$').hasMatch(compact)) {
+        for (var j = 0; j + 4 <= compact.length; j += 4) {
+          raw.add(_last3(compact.substring(j, j + 4)));
+        }
+        continue;
+      }
+      final d = _digitsOnly(entry);
+      if (d.length == 4) {
+        raw.add(_last3(entry));
+      } else if (d.length == 3) {
+        raw.add(d.padLeft(3, '0'));
+      }
+    }
+    if (raw.length < 3) {
+      return List<String>.filled(30, '---');
+    }
+    return _sortedCompliments(raw);
+  }
+
+  static bool _dearHasCompliments(FetchedResultData data) =>
+      data.compliments.any(_isValidCell);
+
+  static FetchedResultData _mergeDearFetched(
+    FetchedResultData api,
+    FetchedResultData pdf,
+  ) {
+    final prizes = List<String>.filled(5, '---');
+    for (var i = 0; i < 5; i++) {
+      final fromApi = i < api.prizes.length ? api.prizes[i] : '---';
+      final fromPdf = i < pdf.prizes.length ? pdf.prizes[i] : '---';
+      prizes[i] =
+          _isValidCell(fromApi) ? fromApi : (_isValidCell(fromPdf) ? fromPdf : '---');
+    }
+
+    final compliments = List<String>.filled(30, '---');
+    final complSource =
+        _dearHasCompliments(pdf) ? pdf.compliments : api.compliments;
+    for (var i = 0; i < 30; i++) {
+      compliments[i] = i < complSource.length ? complSource[i] : '---';
+    }
+
+    return FetchedResultData(
+      drawCode: api.drawCode.trim().isNotEmpty
+          ? api.drawCode.trim().toUpperCase()
+          : pdf.drawCode.trim().toUpperCase(),
+      date: api.date,
+      prizes: prizes,
+      compliments: compliments,
+    );
+  }
+
+  static FetchedResultData? _mergeDearIfNeeded(
+    FetchedResultData? api,
+    FetchedResultData? pdf,
+  ) {
+    if (api == null) return pdf;
+    if (pdf == null) return api;
+    if (!_dearHasCompliments(api) && _dearHasCompliments(pdf)) {
+      return _mergeDearFetched(api, pdf);
+    }
+    if (DearFastResultSource.hasFullResult(api)) return api;
+    if (DearFastResultSource.hasFullResult(pdf)) {
+      return _mergeDearFetched(api, pdf);
+    }
+    return _mergeDearFetched(api, pdf);
+  }
+
   @visibleForTesting
   static FetchedResultData? parseDearApiJson(
     String drawCode,
@@ -352,7 +424,10 @@ class ResultFetchService {
     final third = _stringList(p['3rd']);
     final fourth = _stringList(p['4th']);
     final fifth = _stringList(p['5th']);
-    final cons = _stringList(json['cons']);
+    final cons = [
+      ..._stringList(p['cons']),
+      ..._stringList(json['cons']),
+    ];
 
     final prizes = [
       firstPrize,
@@ -362,10 +437,7 @@ class ResultFetchService {
       _dearFifthPrizeDisplay(fourth, fifth),
     ];
 
-    final complimentSource = fifth.isNotEmpty ? fifth : cons;
-    final compliments = _sortedCompliments(
-      complimentSource.map(_last3).toList(),
-    );
+    final compliments = _dearComplimentsFromCons(cons);
 
     return FetchedResultData(
       drawCode: drawCode.trim().toUpperCase(),
@@ -448,26 +520,32 @@ class ResultFetchService {
       istToday.subtract(const Duration(days: 1)),
     );
 
-    FetchedResultData? best;
-
-    best = await fetchDearApi(code, day);
-    if (_dearFetchUseful(best)) {
+    final apiData = await fetchDearApi(code, day);
+    if (apiData != null && DearFastResultSource.hasFullResult(apiData)) {
       debugPrint('fetchDear $code: api');
-      return best;
+      return apiData;
     }
 
-    best = await DearFastResultSource.fetchDearLotteryDotInPdf(code, day);
+    FetchedResultData? best;
+
+    best = _mergeDearIfNeeded(
+      apiData,
+      await DearFastResultSource.fetchDearLotteryDotInPdf(code, day),
+    );
     if (_dearFetchUseful(best)) {
       debugPrint('fetchDear $code: dearlottery-pdf');
       return best;
     }
 
     if (isToday || isYesterday) {
-      best = await DearLotteryInSource.fetch(
-        code,
-        day,
-        now: istNow,
-        requirePublishedChart: true,
+      best = _mergeDearIfNeeded(
+        apiData,
+        await DearLotteryInSource.fetch(
+          code,
+          day,
+          now: istNow,
+          requirePublishedChart: true,
+        ),
       );
       if (_dearFetchUseful(best)) {
         debugPrint('fetchDear $code: chart+pdf');
@@ -475,27 +553,41 @@ class ResultFetchService {
       }
     }
 
-    best = await DearFastResultSource.fetchPdf(code, day);
+    best = _mergeDearIfNeeded(
+      apiData,
+      await DearFastResultSource.fetchPdf(code, day),
+    );
     if (_dearFetchUseful(best)) {
       debugPrint('fetchDear $code: mirror-pdf');
       return best;
     }
 
-    best = await DearLotteryInSource.fetch(
-      code,
-      day,
-      now: istNow,
-      requirePublishedChart: false,
+    best = _mergeDearIfNeeded(
+      apiData,
+      await DearLotteryInSource.fetch(
+        code,
+        day,
+        now: istNow,
+        requirePublishedChart: false,
+      ),
     );
     if (_dearFetchUseful(best)) {
       debugPrint('fetchDear $code: nagaland-pdf');
       return best;
     }
 
-    best = await DearFastResultSource.fetchHtml(code, day);
+    best = _mergeDearIfNeeded(
+      apiData,
+      await DearFastResultSource.fetchHtml(code, day),
+    );
     if (_dearFetchUseful(best, allowFirstPrizeOnly: !isToday)) {
       debugPrint('fetchDear $code: html-first');
       return best;
+    }
+
+    if (apiData != null && _dearFetchUseful(apiData)) {
+      debugPrint('fetchDear $code: api-partial');
+      return apiData;
     }
 
     debugPrint('fetchDear $code: no data for $day');
