@@ -4339,7 +4339,39 @@ Color _billReceiptFooterDrawColor(
   return kAppBlue;
 }
 
-Widget _billReceiptMetaSection(BillRecord bill) {
+double _billReceiptRowDisplayAmount(Map<String, dynamic> row) {
+  var amount = BillRecord.readRowAmount(row['amount']);
+  if (amount > 0) return amount;
+  final count = int.tryParse(row['count'].toString()) ?? 0;
+  final rate = BillRecord.readRowRate(row['rate']);
+  if (count > 0 && rate > 0) return rate * count;
+  return amount;
+}
+
+({double agent, double customer}) _billReceiptAmountTotals(
+  BillRecord bill,
+  List<Map<String, dynamic>> rows,
+) {
+  double agent = 0;
+  double customer = 0;
+  final scheme = PriceListStore.gameRatesFor(bill.username).billingScheme;
+  for (final row in rows) {
+    final c = int.tryParse(row['count'].toString()) ?? 0;
+    if (c <= 0) continue;
+    agent += _billReceiptRowDisplayAmount(row);
+    customer += applyBillingSchemeAmount(
+      c * getRetailRate(row['type'].toString()),
+      scheme,
+    );
+  }
+  return (agent: agent, customer: customer);
+}
+
+Widget _billReceiptMetaSection(
+  BillRecord bill, {
+  double? agentAmount,
+  double? customerAmount,
+}) {
   final billNote = bill.billNote;
   return Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -4406,7 +4438,33 @@ Widget _billReceiptMetaSection(BillRecord bill) {
       Divider(height: 1, color: Colors.grey.shade300),
       Padding(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-        child: _billReceiptMetaLabel('SA', bill.username),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: _billReceiptMetaLabel('SA', bill.username),
+            ),
+            if (agentAmount != null && customerAmount != null)
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    _billReceiptMetaLabel(
+                      'Agent Amt',
+                      formatSalesAmount(agentAmount),
+                      align: TextAlign.end,
+                    ),
+                    const SizedBox(height: 2),
+                    _billReceiptMetaLabel(
+                      'Customer Amt',
+                      formatSalesAmount(customerAmount),
+                      align: TextAlign.end,
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
       ),
     ],
   );
@@ -4415,7 +4473,7 @@ Widget _billReceiptMetaSection(BillRecord bill) {
 Widget _billReceiptTableHeaderRow() {
   return Container(
     color: kBillReceiptTableHeader,
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
     child: const Row(
       children: [
         Expanded(
@@ -4425,7 +4483,7 @@ Widget _billReceiptTableHeaderRow() {
             style: TextStyle(
               color: Colors.white,
               fontWeight: FontWeight.w700,
-              fontSize: 14,
+              fontSize: 12,
             ),
           ),
         ),
@@ -4437,7 +4495,7 @@ Widget _billReceiptTableHeaderRow() {
             style: TextStyle(
               color: Colors.white,
               fontWeight: FontWeight.w700,
-              fontSize: 14,
+              fontSize: 12,
             ),
           ),
         ),
@@ -4449,7 +4507,7 @@ Widget _billReceiptTableHeaderRow() {
             style: TextStyle(
               color: Colors.white,
               fontWeight: FontWeight.w700,
-              fontSize: 14,
+              fontSize: 12,
             ),
           ),
         ),
@@ -4461,7 +4519,7 @@ Widget _billReceiptTableHeaderRow() {
             style: TextStyle(
               color: Colors.white,
               fontWeight: FontWeight.w700,
-              fontSize: 14,
+              fontSize: 12,
             ),
           ),
         ),
@@ -4476,14 +4534,14 @@ Widget _billReceiptDataRow({
   String drawFilter = 'ALL',
   VoidCallback? onLongPress,
 }) {
-  final amount = BillRecord.readRowAmount(row['amount']);
+  final amount = _billReceiptRowDisplayAmount(row);
   final rowColor = _billReceiptRowDrawColor(
     bill,
     row['type'].toString(),
     drawFilter: drawFilter,
   );
   const rowTextStyle = TextStyle(
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: FontWeight.w700,
     color: Colors.white,
   );
@@ -4499,7 +4557,7 @@ Widget _billReceiptDataRow({
             ),
           ),
         ),
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         child: Row(
           children: [
             Expanded(
@@ -4531,7 +4589,7 @@ Widget _billReceiptDataRow({
             Expanded(
               flex: 2,
               child: Text(
-                amount.toStringAsFixed(2),
+                formatSalesAmount(amount),
                 textAlign: TextAlign.center,
                 style: rowTextStyle,
               ),
@@ -4576,11 +4634,19 @@ Widget _billReceiptDetailsPanel(
   List<Map<String, dynamic>> rows, {
   String drawFilter = 'ALL',
   void Function(int index)? onRowLongPress,
+  bool showAmountSummary = true,
 }) {
+  final amounts = showAmountSummary
+      ? _billReceiptAmountTotals(bill, rows)
+      : (agent: 0.0, customer: 0.0);
   return Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
-      _billReceiptMetaSection(bill),
+      _billReceiptMetaSection(
+        bill,
+        agentAmount: showAmountSummary ? amounts.agent : null,
+        customerAmount: showAmountSummary ? amounts.customer : null,
+      ),
       _billReceiptTableSection(
         bill,
         rows,
@@ -10738,37 +10804,6 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     showSuccessSnack(context, AppMsg.billDeleted(bill.billNo));
   }
 
-  Future<void> _openReceiptEditPage(BillRecord bill) async {
-    final bool? deleted = await Navigator.push<bool>(
-      context,
-      appRoute(EditBillPage(initialBillNo: bill.billNo)),
-    );
-    if (!mounted) return;
-
-    setState(() {
-      if (deleted == true) {
-        _bills.removeWhere((b) => b.billNo == bill.billNo);
-        _expandedBillNos.remove(bill.billNo);
-      } else {
-        final updated = BillsStore.byBillNo(bill.billNo);
-        if (updated == null) {
-          _bills.removeWhere((b) => b.billNo == bill.billNo);
-          _expandedBillNos.remove(bill.billNo);
-        } else {
-          final idx = _bills.indexWhere((b) => b.billNo == bill.billNo);
-          if (idx >= 0) _bills[idx] = updated;
-        }
-      }
-      if (_expandedBillNos.length != _visibleBills.length) {
-        _expandAll = false;
-      }
-    });
-
-    if (_bills.isEmpty && mounted) {
-      Navigator.pop(context);
-    }
-  }
-
   String _salesDrawFooterLabel(String code) {
     switch (code.toUpperCase()) {
       case 'DEAR1':
@@ -10881,114 +10916,104 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     );
     final billName = displayBill.billNote;
 
+    Widget receiptDetails() {
+      return ColoredBox(
+        color: Colors.white,
+        child: _billReceiptDetailsPanel(
+          displayBill,
+          rows,
+          drawFilter: widget.drawFilter,
+        ),
+      );
+    }
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Material(
-          color: Colors.white,
-          child: InkWell(
-            onTap: () => _toggleBill(displayBill.billNo),
-            onLongPress: () => _openReceiptEditPage(displayBill),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-              child: Column(
-                children: [
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        flex: 3,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('${displayBill.billNo}', style: summaryStyle),
-                            if (billName.isNotEmpty) ...[
-                              const SizedBox(height: 3),
+        if (!expanded)
+          Material(
+            color: Colors.white,
+            child: InkWell(
+              onTap: () => _toggleBill(displayBill.billNo),
+              onLongPress: () => _confirmDeleteBill(displayBill),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+                child: Column(
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
                               Text(
-                                billName,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: summaryStyle.copyWith(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w800,
-                                  color: kAppBlueDark,
+                                '${displayBill.billNo}',
+                                style: summaryStyle,
+                              ),
+                              if (billName.isNotEmpty) ...[
+                                const SizedBox(height: 3),
+                                Text(
+                                  billName,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: summaryStyle.copyWith(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w800,
+                                    color: kAppBlueDark,
+                                  ),
                                 ),
-                              ),
+                              ],
                             ],
-                          ],
-                        ),
-                      ),
-                      Expanded(
-                        flex: 3,
-                        child: Text(
-                          _billTime24(displayBill.createdAt),
-                          textAlign: TextAlign.center,
-                          style: summaryStyle,
-                        ),
-                      ),
-                      Expanded(
-                        flex: 2,
-                        child: Text(
-                          '${totals.count}',
-                          textAlign: TextAlign.center,
-                          style: summaryStyle,
-                        ),
-                      ),
-                      Expanded(
-                        flex: 3,
-                        child: Text(
-                          formatSalesAmount(totals.agent),
-                          textAlign: TextAlign.end,
-                          style: summaryStyle,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(
-                        child: Text(
-                          _billDateShort(displayBill.businessDate),
-                          style: summaryStyle.copyWith(fontSize: 15),
-                        ),
-                      ),
-                      Material(
-                        color: Colors.grey.shade500,
-                        borderRadius: BorderRadius.zero,
-                        child: InkWell(
-                          onTap: () => _confirmDeleteBill(displayBill),
-                          child: const Padding(
-                            padding: EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 7,
-                            ),
-                            child: Text(
-                              'Delete Bill',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600,
-                                fontSize: 13,
-                              ),
-                            ),
                           ),
                         ),
+                        Expanded(
+                          flex: 3,
+                          child: Text(
+                            _billTime24(displayBill.createdAt),
+                            textAlign: TextAlign.center,
+                            style: summaryStyle,
+                          ),
+                        ),
+                        Expanded(
+                          flex: 2,
+                          child: Text(
+                            '${totals.count}',
+                            textAlign: TextAlign.center,
+                            style: summaryStyle,
+                          ),
+                        ),
+                        Expanded(
+                          flex: 3,
+                          child: Text(
+                            formatSalesAmount(totals.agent),
+                            textAlign: TextAlign.end,
+                            style: summaryStyle,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        _billDateShort(displayBill.businessDate),
+                        style: summaryStyle.copyWith(fontSize: 15),
                       ),
-                    ],
-                  ),
-                ],
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ),
-        if (expanded)
-          ColoredBox(
+          )
+        else
+          Material(
             color: Colors.white,
-            child: _billReceiptDetailsPanel(
-              displayBill,
-              rows,
-              drawFilter: widget.drawFilter,
+            child: InkWell(
+              onTap: () => _toggleBill(displayBill.billNo),
+              onLongPress: () => _confirmDeleteBill(displayBill),
+              child: receiptDetails(),
             ),
           ),
         Divider(height: 1, thickness: 1, color: Colors.grey.shade300),
