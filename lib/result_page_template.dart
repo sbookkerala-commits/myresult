@@ -229,23 +229,26 @@ class ResultWinningNumbersSearchButton extends StatelessWidget {
     super.key,
     required this.onPressed,
     this.loading = false,
+    this.color,
   });
 
   final VoidCallback? onPressed;
   final bool loading;
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
+    final bg = color ?? kResultClassicHeaderBlue;
     return SizedBox(
       width: 132,
       height: 34,
       child: OutlinedButton(
         onPressed: loading ? null : onPressed,
         style: OutlinedButton.styleFrom(
-          backgroundColor: kResultClassicHeaderBlue,
+          backgroundColor: bg,
           foregroundColor: Colors.white,
           disabledForegroundColor: Colors.white,
-          disabledBackgroundColor: kResultClassicHeaderBlue,
+          disabledBackgroundColor: bg,
           side: const BorderSide(color: kResultClassicSearchGold, width: 2),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
           padding: EdgeInsets.zero,
@@ -623,6 +626,7 @@ class ResultShareCaptureCard extends StatelessWidget {
     this.showBookingWhatsappBar = true,
     required this.prizes,
     required this.compliments,
+    this.searchButtonColor,
   });
 
   final double width;
@@ -633,6 +637,7 @@ class ResultShareCaptureCard extends StatelessWidget {
   final bool showBookingWhatsappBar;
   final List<String> prizes;
   final List<String> compliments;
+  final Color? searchButtonColor;
 
   static const double _prizeFraction = 0.37;
 
@@ -683,8 +688,11 @@ class ResultShareCaptureCard extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: gapAfterSearch),
-                const Center(
-                  child: ResultWinningNumbersSearchButton(onPressed: null),
+                Center(
+                  child: ResultWinningNumbersSearchButton(
+                    onPressed: null,
+                    color: searchButtonColor,
+                  ),
                 ),
                 const SizedBox(height: gapAfterButton),
                 if (showBookingWhatsappBar) ...[

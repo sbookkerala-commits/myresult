@@ -160,6 +160,22 @@ class ApiService {
     return items.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
+  /// Logged-in user profile — login block, sales block, limits, scheme, rate set.
+  static Future<Map<String, dynamic>?> getCurrentUserProfile() async {
+    if (_token == null) return null;
+    final res = await http
+        .get(
+          Uri.parse('${ApiConfig.baseUrl}/api/users/me'),
+          headers: _headers,
+        )
+        .timeout(const Duration(seconds: 8));
+    if (res.statusCode != 200) return null;
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final user = data['user'];
+    if (user is! Map) return null;
+    return Map<String, dynamic>.from(user);
+  }
+
   static Future<List<Map<String, dynamic>>> getChartArchive() async {
     final res = await http
         .get(

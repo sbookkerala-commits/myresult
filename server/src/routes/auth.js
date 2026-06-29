@@ -35,6 +35,13 @@ router.post('/login', async (req, res) => {
         username: user.username,
         role: user.role,
         isBlocked: user.isBlocked,
+        isSalesBlocked: user.isSalesBlocked,
+        scheme: user.scheme,
+        rateSetId: user.rateSetId,
+        amountLimit: user.amountLimit,
+        digit1CountLimit: user.digit1CountLimit,
+        digit2CountLimit: user.digit2CountLimit,
+        digit3CountLimit: user.digit3CountLimit,
       },
     });
   } catch (e) {

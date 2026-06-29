@@ -5,6 +5,7 @@ const Result = require('../models/Result');
 const Pending = require('../models/Pending');
 const ChartArchive = require('../models/ChartArchive');
 const Settings = require('../models/Settings');
+const User = require('../models/User');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
 
@@ -17,7 +18,7 @@ router.get('/restore', authRequired, async (req, res) => {
     const owner =
       req.user.role === 'ADMIN' ? {} : { ownerUsername: req.user.username };
 
-    const [bookings, sales, results, pending, chartArchive, settingsDocs] =
+    const [bookings, sales, results, pending, chartArchive, settingsDocs, profileUser] =
       await Promise.all([
         Booking.find({ deletedAt: null, createdAt: { $gte: cutoff }, ...owner })
           .sort({ createdAt: -1 })
@@ -37,6 +38,11 @@ router.get('/restore', authRequired, async (req, res) => {
           .lean(),
         ChartArchive.find().sort({ date: -1 }).limit(5000).lean(),
         Settings.find().lean(),
+        User.findOne({ username: req.user.username, deletedAt: null })
+          .select(
+            'username role isBlocked isSalesBlocked scheme rateSetId amountLimit digit1CountLimit digit2CountLimit digit3CountLimit'
+          )
+          .lean(),
       ]);
 
     const settings = {};
@@ -85,6 +91,20 @@ router.get('/restore', authRequired, async (req, res) => {
         compliments: c.compliments,
       })),
       settings,
+      profile: profileUser
+        ? {
+            username: profileUser.username,
+            role: profileUser.role,
+            isBlocked: profileUser.isBlocked,
+            isSalesBlocked: profileUser.isSalesBlocked,
+            scheme: profileUser.scheme,
+            rateSetId: profileUser.rateSetId,
+            amountLimit: profileUser.amountLimit,
+            digit1CountLimit: profileUser.digit1CountLimit,
+            digit2CountLimit: profileUser.digit2CountLimit,
+            digit3CountLimit: profileUser.digit3CountLimit,
+          }
+        : null,
     });
   } catch (e) {
     console.error('restore', e);

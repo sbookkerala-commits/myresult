@@ -223,6 +223,7 @@ Future<void> _initNetworkServices() async {
 Timer? _retentionPurgeTimer;
 Timer? _dearAutoFetchTimer;
 Timer? _keralaAutoFetchTimer;
+Timer? _userProfileSyncTimer;
 
 Future<void> _runDearAutoFetchTick() async {
   try {
@@ -650,6 +651,48 @@ class UserStore {
       debugPrint('UserStore cloud pull failed: $e');
     }
   }
+
+  /// Merge admin profile fields from cloud into local store (current user).
+  static Future<bool> applyCloudProfile(Map<String, dynamic> cloud) async {
+    final username = (cloud['username']?.toString() ?? '').trim();
+    if (username.isEmpty) return false;
+
+    final idx = _indexOfUsername(username);
+    final existing = idx >= 0 ? users.value[idx] : null;
+    final cloudUser = AppUser.fromCloudMap(cloud, existing: existing);
+    if (cloudUser == null) return false;
+
+    final next = List<AppUser>.from(users.value);
+    if (idx >= 0) {
+      next[idx] = cloudUser.copyWith(
+        password: existing!.password.isNotEmpty ? existing.password : cloudUser.password,
+      );
+    } else {
+      next.add(cloudUser);
+    }
+    users.value = next;
+    _scheduleSave();
+    return true;
+  }
+
+  /// Pull logged-in user profile from cloud (~1s sync for agents).
+  static Future<bool> syncCurrentUserFromCloud() async {
+    if (ApiService.token == null) return false;
+    final sessionUser = AppSession.username.trim();
+    if (sessionUser.isEmpty) return false;
+
+    try {
+      final cloud = await ApiService.getCurrentUserProfile();
+      if (cloud == null || cloud.isEmpty) return false;
+      return await applyCloudProfile(cloud);
+    } catch (e) {
+      debugPrint('UserStore profile sync failed: $e');
+      return false;
+    }
+  }
+
+  static bool isLoginBlocked(String username) =>
+      byUsername(username)?.isBlocked ?? false;
 
   static Future<void> init() async {
     await reloadFromDisk();
@@ -2365,9 +2408,23 @@ Future<void> pullBookingsFromCloud() async {
 
 bool _postLoginSyncScheduled = false;
 
+void startUserProfileSyncTimer() {
+  _userProfileSyncTimer?.cancel();
+  _userProfileSyncTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    if (ApiService.token == null || AppSession.username.trim().isEmpty) return;
+    unawaited(UserStore.syncCurrentUserFromCloud());
+  });
+}
+
+void stopUserProfileSyncTimer() {
+  _userProfileSyncTimer?.cancel();
+  _userProfileSyncTimer = null;
+}
+
 void schedulePostLoginSync() {
   if (_postLoginSyncScheduled) return;
   _postLoginSyncScheduled = true;
+  startUserProfileSyncTimer();
   WidgetsBinding.instance.addPostFrameCallback((_) {
     unawaited(runCloudRestoreAfterLogin());
   });
@@ -2479,7 +2536,16 @@ Future<void> applyCloudRestore(Map<String, dynamic> data) async {
     await ResultStore.saveNow();
   }
 
-  await UserStore.pullUsersFromCloud();
+  final profileRaw = data['profile'];
+  if (profileRaw is Map) {
+    await UserStore.applyCloudProfile(Map<String, dynamic>.from(profileRaw));
+  } else {
+    await UserStore.syncCurrentUserFromCloud();
+  }
+
+  if (AppSession.role == 'ADMIN' || AppSession.role == 'AGENT') {
+    await UserStore.pullUsersFromCloud();
+  }
 }
 
 /// Background cloud restore after login (same logic as before, no UI).
@@ -3132,6 +3198,8 @@ void goToMainHome(BuildContext context) {
 }
 
 Future<void> logoutApp(BuildContext context) async {
+  stopUserProfileSyncTimer();
+  _postLoginSyncScheduled = false;
   await SyncService.clearSession();
   AppSession.username = '';
   AppSession.role = '';
@@ -3201,35 +3269,37 @@ class MyApp extends StatelessWidget {
               debugShowCheckedModeBanner: false,
               locale: Locale(lang.name),
               theme: ThemeData(
-                primaryColor: kAppBlue,
+                primaryColor: AppDrawTheme.color,
                 scaffoldBackgroundColor: Colors.white,
                 colorScheme: ColorScheme.fromSeed(
-                  seedColor: kAppBlue,
-                  primary: kAppBlue,
-                  secondary: kAppBlueLight,
+                  seedColor: AppDrawTheme.color,
+                  primary: AppDrawTheme.color,
+                  secondary: AppDrawTheme.colorDark,
                   surface: Colors.white,
                   brightness: Brightness.light,
                 ),
-                appBarTheme: const AppBarTheme(
-                  backgroundColor: kAppBlue,
+                appBarTheme: AppBarTheme(
+                  backgroundColor: kAppHeaderColor,
                   foregroundColor: Colors.white,
                   elevation: 0,
                   surfaceTintColor: Colors.transparent,
                   systemOverlayStyle: SystemUiOverlayStyle(
-                    statusBarColor: kAppBlue,
+                    statusBarColor: kAppHeaderColor,
                     statusBarIconBrightness: Brightness.light,
                     statusBarBrightness: Brightness.dark,
                   ),
                 ),
                 elevatedButtonTheme: ElevatedButtonThemeData(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: kAppBlue,
+                    backgroundColor: AppDrawTheme.color,
                     foregroundColor: Colors.white,
                   ),
                 ),
                 checkboxTheme: CheckboxThemeData(
                   fillColor: WidgetStateProperty.resolveWith((states) {
-                    if (states.contains(WidgetState.selected)) return kAppBlue;
+                    if (states.contains(WidgetState.selected)) {
+                      return AppDrawTheme.color;
+                    }
                     return null;
                   }),
                 ),
@@ -3288,6 +3358,7 @@ class _LoginPageState extends State<LoginPage> {
 
       final uname = userMap['username']?.toString() ?? username;
       final role = userMap['role']?.toString() ?? 'AGENT';
+      await UserStore.applyCloudProfile(userMap);
       await SyncService.saveSession(
         token: loginRes['token']?.toString() ?? '',
         username: uname,
@@ -3536,10 +3607,17 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    _selectedDraw = _menuDrawForUser(widget.username);
-    AppDrawTheme.refreshForUser(widget.username);
+    _selectedDraw = AppDrawTheme.activeDraw.value;
+    if (!_allowedDrawsForUser(widget.username).contains(_selectedDraw)) {
+      _selectedDraw = _menuDrawForUser(widget.username);
+    }
+    AppDrawTheme.setDraw(_selectedDraw);
     _menuClockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
+      if (UserStore.isLoginBlocked(widget.username)) {
+        logoutApp(context);
+        return;
+      }
       final now = DateTime.now();
       final autoDraw = _menuDrawForUser(widget.username, at: now);
       setState(() {
@@ -3550,7 +3628,12 @@ class _HomePageState extends State<HomePage> {
           _userPickedMenuDraw = false;
         }
       });
-      AppDrawTheme.refreshForUser(widget.username, at: now);
+      if (!_userPickedMenuDraw) {
+        _selectedDraw = autoDraw;
+        AppDrawTheme.setDraw(autoDraw);
+      } else {
+        AppDrawTheme.setDraw(_selectedDraw);
+      }
     });
   }
 
@@ -3563,125 +3646,134 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final isAdmin = AppSession.role == "ADMIN";
-    final menuLite = menuDrawLiteColor(_selectedDraw);
     return Scaffold(
       body: Container(
         decoration: _reportPageBgDecoration(),
         child: Scaffold(
           backgroundColor: Colors.transparent,
           appBar: _reportAppBar(widget.username, context, showLogout: true),
-          body: ListView(
-            padding: const EdgeInsets.all(12),
-            children: [
-              _MenuDrawSelector(
-                username: widget.username,
-                selectedDraw: _selectedDraw,
-                now: _now,
-                onDrawChanged: (draw) {
-                  setState(() {
-                    _selectedDraw = draw;
-                    _userPickedMenuDraw = true;
-                  });
-                },
-              ),
-              const SizedBox(height: 12),
-              _simpleMenuCard(
-                [
-                  _simpleMenuTile(
+          body: ValueListenableBuilder<String>(
+            valueListenable: AppDrawTheme.activeDraw,
+            builder: (context, activeDraw, _) {
+              return ListView(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+                children: [
+                  _MenuDrawSelector(
+                    username: widget.username,
+                    selectedDraw: activeDraw,
+                    now: _now,
+                    onDrawChanged: (draw) {
+                      setState(() {
+                        _selectedDraw = draw;
+                        _userPickedMenuDraw = true;
+                      });
+                      AppDrawTheme.setDraw(draw);
+                    },
+                  ),
+                  const SizedBox(height: 14),
+                  _homeMenuTile(
                     context,
-                    rowColor: menuLite,
                     icon: Icons.add_circle_outline,
                     title: 'Add Ticket',
+                    subtitle: 'Add new ticket entries',
+                    iconColor: AppDrawTheme.color,
                     onTap: () => _openAddTicket(
                       context,
                       widget.username,
-                      _selectedDraw,
+                      activeDraw,
                     ),
                   ),
-                  _simpleMenuTile(
+                  _homeMenuTile(
                     context,
-                    rowColor: menuLite,
                     icon: Icons.bar_chart_outlined,
                     title: 'Reports',
+                    subtitle: 'View sales and performance reports',
+                    iconColor: AppDrawTheme.color,
                     onTap: () => Navigator.push(
                       context,
                       appRoute(const ReportsPage()),
                     ),
                   ),
-                  _simpleMenuTile(
+                  _homeMenuTile(
                     context,
-                    rowColor: menuLite,
                     icon: Icons.emoji_events_outlined,
                     title: 'Results',
+                    subtitle: 'View draw results and history',
+                    iconColor: AppDrawTheme.color,
                     onTap: () => Navigator.push(
                       context,
                       appRoute(const DearResultPage()),
                     ),
                   ),
-                  _simpleMenuTile(
+                  _homeMenuTile(
                     context,
-                    rowColor: menuLite,
-                    icon: Icons.list_alt_outlined,
+                    icon: Icons.card_giftcard_outlined,
                     title: 'Prize And Commission',
+                    subtitle: 'Manage prizes and commission settings',
+                    iconColor: AppDrawTheme.color,
                     onTap: () => Navigator.push(
                       context,
                       appRoute(const PriceListPage()),
                     ),
                   ),
-                  _simpleMenuTile(
+                  _homeMenuTile(
                     context,
-                    rowColor: menuLite,
                     icon: Icons.edit_outlined,
                     title: 'Edit / Delete',
+                    subtitle: 'Edit or delete tickets and records',
+                    iconColor: AppDrawTheme.color,
                     onTap: () => Navigator.push(
                       context,
                       appRoute(const EditBillPage()),
                     ),
                   ),
                   if (isAdmin)
-                    _simpleMenuTile(
+                    _homeMenuTile(
                       context,
-                      rowColor: menuLite,
                       icon: Icons.filter_3_outlined,
                       title: 'Digit Count Limits',
+                      subtitle: 'Set limits for 1, 2, 3 digit numbers',
+                      iconColor: AppDrawTheme.color,
                       onTap: () => Navigator.push(
                         context,
                         appRoute(const DigitCountLimitsPage()),
                       ),
                     ),
                   if (isAdmin)
-                    _simpleMenuTile(
+                    _homeMenuTile(
                       context,
-                      rowColor: menuLite,
                       icon: Icons.schedule_outlined,
                       title: 'Draw Timings',
+                      subtitle: 'Manage draw opening and closing times',
+                      iconColor: AppDrawTheme.color,
                       onTap: () => Navigator.push(
                         context,
                         appRoute(const DrawSchedulePage()),
                       ),
                     ),
                   if (isAdmin)
-                    _simpleMenuTile(
+                    _homeMenuTile(
                       context,
-                      rowColor: menuLite,
                       icon: Icons.people_outline,
                       title: 'Manage Users',
+                      subtitle: 'Add, edit and manage users',
+                      iconColor: AppDrawTheme.color,
                       onTap: () => Navigator.push(
                         context,
                         appRoute(const ManageUsersPage()),
                       ),
                     ),
-                  _simpleMenuTile(
+                  _homeMenuTile(
                     context,
-                    rowColor: menuLite,
                     icon: Icons.language_outlined,
                     title: AppMsg.menuLanguage,
+                    subtitle: 'Choose your preferred language',
+                    iconColor: AppDrawTheme.color,
                     onTap: () => showLanguagePicker(context),
                   ),
                 ],
-                flat: true,
-              ),
-            ],
+              );
+            },
           ),
         ),
       ),
@@ -3689,73 +3781,71 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
-Widget _simpleMenuTile(
+Widget _homeMenuTile(
   BuildContext context, {
   required IconData icon,
   required String title,
+  required String subtitle,
+  required Color iconColor,
   required VoidCallback onTap,
-  Color? rowColor,
-  Color? borderColor,
 }) {
-  final edge = borderColor ?? Colors.grey.shade400;
-  return DecoratedBox(
-    decoration: BoxDecoration(
-      color: rowColor ?? Colors.transparent,
-      border: rowColor != null
-          ? Border(
-              bottom: BorderSide(color: edge, width: 1.5),
-            )
-          : null,
-    ),
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 10),
     child: Material(
       color: Colors.transparent,
       child: InkWell(
         onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(
-            children: [
-              Container(
-                width: 40,
-                height: 40,
-                color: kMenuIconMazha,
-                alignment: Alignment.center,
-                child: Icon(icon, size: 22, color: Colors.white),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w500,
-                    color: Color(0xFF263238),
+        child: Ink(
+          color: Colors.white,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: 14,
+              vertical: 12,
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  color: iconColor,
+                  alignment: Alignment.center,
+                  child: Icon(icon, size: 22, color: Colors.white),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: kAppBlue,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w400,
+                          color: Colors.blueGrey.shade400,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ),
-              Icon(Icons.chevron_right, size: 20, color: kMenuIconMazha),
-            ],
+                Icon(
+                  Icons.chevron_right,
+                  size: 22,
+                  color: Colors.grey.shade400,
+                ),
+              ],
+            ),
           ),
         ),
       ),
-    ),
-  );
-}
-
-Widget _simpleMenuCard(
-  List<Widget> items, {
-  bool flat = true,
-}) {
-  return Container(
-    decoration: const BoxDecoration(
-      color: Colors.transparent,
-    ),
-    clipBehavior: Clip.none,
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        for (int i = 0; i < items.length; i++) items[i],
-      ],
     ),
   );
 }
@@ -3804,9 +3894,9 @@ Future<void> showLanguagePicker(BuildContext context) async {
 
 const Color _reportBg = kAppSurface;
 
-BoxDecoration _appGradientBox({BorderRadius? radius}) {
+BoxDecoration _appGradientBox({BorderRadius? radius, Color? color}) {
   return BoxDecoration(
-    color: kAppBlue,
+    color: color ?? AppDrawTheme.color,
     borderRadius: radius ?? BorderRadius.zero,
   );
 }
@@ -3830,10 +3920,11 @@ Widget _appGradientButton({
   required VoidCallback? onPressed,
   required Widget child,
   bool flat = true,
+  Color? color,
 }) {
   const radius = BorderRadius.zero;
   return DecoratedBox(
-    decoration: _appGradientBox(radius: radius),
+    decoration: _appGradientBox(radius: radius, color: color),
     child: ElevatedButton(
       onPressed: onPressed,
       style: ElevatedButton.styleFrom(
@@ -3856,7 +3947,9 @@ AppBar _reportAppBar(
   VoidCallback? onBack,
   bool showLogout = false,
   List<Widget>? extraActions,
+  Color? backgroundColor,
 }) {
+  final barColor = backgroundColor ?? kAppHeaderColor;
   return AppBar(
     leading: onBack != null
         ? IconButton(
@@ -3873,7 +3966,7 @@ AppBar _reportAppBar(
         fontSize: 17,
       ),
     ),
-    backgroundColor: kAppBlue,
+    backgroundColor: barColor,
     foregroundColor: Colors.white,
     elevation: 0,
     surfaceTintColor: Colors.transparent,
@@ -3906,6 +3999,8 @@ const Color kDraw8PmColorDark = Color(0xFF2A4018);
 const Color kAppBlue = Color(0xFF0B3D7A);
 const Color kAppBlueDark = Color(0xFF062952);
 const Color kAppBlueLight = Color(0xFF1565C0);
+/// Fixed app chrome header — not tied to active draw.
+const Color kAppHeaderColor = kAppBlue;
 const Color kAppSurface = Color(0xFFF5F8FC);
 const List<Color> kAppBlueGradient = [
   kAppBlue,
@@ -4034,10 +4129,21 @@ List<Color> _drawLightGradientForTime(String drawTime) {
   return [light, light];
 }
 
-/// Active draw tint for app chrome — follows menu selection or open-time draw.
+/// Active draw tint for app chrome — single draw color across all pages.
 class AppDrawTheme {
   static final ValueNotifier<String> activeDraw =
       ValueNotifier<String>(kDrawTimeNames.first);
+
+  static Color get color => _drawColorForTime(activeDraw.value);
+
+  static Color get colorDark {
+    final g = _drawGradientForTime(activeDraw.value);
+    return g.length > 1 ? g.last : g.first;
+  }
+
+  static Color get liteColor => _drawLiteColorForTime(activeDraw.value);
+
+  static List<Color> get gradient => _drawGradientForTime(activeDraw.value);
 
   static void setDraw(String drawTime) {
     final d = drawTime.trim();
@@ -4066,13 +4172,18 @@ class AppDrawTheme {
   }
 }
 
-Color get _appPrimary => kAppBlue;
+Color get _appPrimary => AppDrawTheme.color;
 
-List<Color> get _appGradient => kAppBlueGradient;
+List<Color> get _appGradient => AppDrawTheme.gradient;
 
 Color get _salesAccent => _appPrimary;
 
 Color _salesDrawColor(String code) => _drawColorForCode(code);
+
+Color _reportDrawChromeColor(String drawCode) {
+  if (drawCode != 'ALL') return _salesDrawColor(drawCode);
+  return AppDrawTheme.color;
+}
 
 Color _salesDrawTint(String code) =>
     code == 'ALL'
@@ -4122,6 +4233,362 @@ String _salesRowTypeDisplayLabel(String type) {
     return drawCode == 'LSK3' ? 'K-$pm' : 'DEAR-$pm';
   }
   return '$suffix-$pm';
+}
+
+const Color kBillReceiptTableHeader = Color(0xFF616161);
+
+String _formatBillBusinessDate(DateTime dt) {
+  final local = dt.toLocal();
+  return '${local.year.toString().padLeft(4, '0')}-'
+      '${local.month.toString().padLeft(2, '0')}-'
+      '${local.day.toString().padLeft(2, '0')}';
+}
+
+String _formatBillSaleTime24(DateTime dt) {
+  final local = dt.toLocal();
+  return '${local.hour.toString().padLeft(2, '0')}:'
+      '${local.minute.toString().padLeft(2, '0')}:'
+      '${local.second.toString().padLeft(2, '0')}';
+}
+
+Widget _billReceiptMetaLabel(String label, String value,
+    {TextAlign align = TextAlign.start}) {
+  return RichText(
+    textAlign: align,
+    text: TextSpan(
+      style: const TextStyle(fontSize: 14, color: Color(0xFF212121)),
+      children: [
+        TextSpan(text: '$label : '),
+        TextSpan(
+          text: value,
+          style: const TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ],
+    ),
+  );
+}
+
+String _billReceiptDrawShort(String drawName) {
+  switch (drawName.trim()) {
+    case 'DEAR 1 PM':
+      return '1PM';
+    case 'LSK 3 PM':
+      return '3PM';
+    case 'DEAR 6 PM':
+      return '6PM';
+    case 'DEAR 8 PM':
+      return '8PM';
+    default:
+      return drawName.replaceAll(' ', '');
+  }
+}
+
+String _billReceiptTicketLabel(String type, String drawName) {
+  final i = type.lastIndexOf('-');
+  final suffix =
+      i >= 0 ? type.substring(i + 1).toUpperCase() : type.toUpperCase();
+  final drawShort = _billReceiptDrawShort(drawName);
+  switch (suffix) {
+    case 'SUPER':
+      return 'Super-$drawShort';
+    case 'BOX':
+      return 'Box-$drawShort';
+    case 'A':
+      return 'A-$drawShort';
+    case 'B':
+      return 'B-$drawShort';
+    case 'C':
+      return 'C-$drawShort';
+    case 'AB':
+      return 'AB-$drawShort';
+    case 'BC':
+      return 'BC-$drawShort';
+    case 'AC':
+      return 'AC-$drawShort';
+    default:
+      return type;
+  }
+}
+
+Color _billReceiptRowDrawColor(
+  BillRecord bill,
+  String rowType, {
+  String drawFilter = 'ALL',
+}) {
+  if (drawFilter != 'ALL') return _salesDrawColor(drawFilter);
+  final code = _drawCodeFromRowType(rowType);
+  if (code != 'ALL') return _salesDrawColor(code);
+  final fromDraw = _drawCodeFromFilter(bill.effectiveDrawName);
+  if (fromDraw.isNotEmpty) return _salesDrawColor(fromDraw);
+  return _drawColorForTime(bill.effectiveDrawName);
+}
+
+Color _billReceiptFooterDrawColor(
+  BillRecord bill, {
+  String drawFilter = 'ALL',
+}) {
+  if (drawFilter != 'ALL') return _salesDrawColor(drawFilter);
+  final fromDraw = _drawCodeFromFilter(bill.effectiveDrawName);
+  if (fromDraw.isNotEmpty) return _salesDrawColor(fromDraw);
+  if (bill.rows.isNotEmpty) {
+    return _billReceiptRowDrawColor(
+      bill,
+      bill.rows.first['type'].toString(),
+    );
+  }
+  return kAppBlue;
+}
+
+Widget _billReceiptMetaSection(BillRecord bill) {
+  final billNote = bill.billNote;
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: _billReceiptMetaLabel(
+                'Bil NO',
+                bill.billNo.toString(),
+              ),
+            ),
+            Expanded(
+              child: _billReceiptMetaLabel(
+                'Draw Date',
+                _formatBillBusinessDate(bill.businessDate),
+                align: TextAlign.end,
+              ),
+            ),
+          ],
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: _billReceiptMetaLabel(
+                'Draw',
+                menuDrawShortLabel(bill.effectiveDrawName),
+              ),
+            ),
+            Expanded(
+              child: _billReceiptMetaLabel(
+                'Sale Time',
+                _formatBillSaleTime24(bill.createdAt),
+                align: TextAlign.end,
+              ),
+            ),
+          ],
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: _billReceiptMetaLabel('A', bill.username),
+            ),
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: _billReceiptMetaLabel(
+                  'Bill Note',
+                  billNote.isNotEmpty ? billNote : '',
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      Divider(height: 1, color: Colors.grey.shade300),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+        child: _billReceiptMetaLabel('SA', bill.username),
+      ),
+    ],
+  );
+}
+
+Widget _billReceiptTableHeaderRow() {
+  return Container(
+    color: kBillReceiptTableHeader,
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+    child: const Row(
+      children: [
+        Expanded(
+          flex: 3,
+          child: Text(
+            'Ticket',
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 14,
+            ),
+          ),
+        ),
+        Expanded(
+          flex: 2,
+          child: Text(
+            'Number',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 14,
+            ),
+          ),
+        ),
+        Expanded(
+          flex: 2,
+          child: Text(
+            'Count',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 14,
+            ),
+          ),
+        ),
+        Expanded(
+          flex: 2,
+          child: Text(
+            'Amount',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 14,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+Widget _billReceiptDataRow({
+  required BillRecord bill,
+  required Map<String, dynamic> row,
+  String drawFilter = 'ALL',
+  VoidCallback? onLongPress,
+}) {
+  final amount = BillRecord.readRowAmount(row['amount']);
+  final rowColor = _billReceiptRowDrawColor(
+    bill,
+    row['type'].toString(),
+    drawFilter: drawFilter,
+  );
+  const rowTextStyle = TextStyle(
+    fontSize: 14,
+    fontWeight: FontWeight.w700,
+    color: Colors.white,
+  );
+  return Material(
+    color: rowColor,
+    child: InkWell(
+      onLongPress: onLongPress,
+      child: Container(
+        decoration: BoxDecoration(
+          border: Border(
+            top: BorderSide(
+              color: Colors.white.withValues(alpha: 0.28),
+            ),
+          ),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        child: Row(
+          children: [
+            Expanded(
+              flex: 3,
+              child: Text(
+                _billReceiptTicketLabel(
+                  row['type'].toString(),
+                  bill.effectiveDrawName,
+                ),
+                style: rowTextStyle,
+              ),
+            ),
+            Expanded(
+              flex: 2,
+              child: Text(
+                row['number'].toString(),
+                textAlign: TextAlign.center,
+                style: rowTextStyle,
+              ),
+            ),
+            Expanded(
+              flex: 2,
+              child: Text(
+                row['count'].toString(),
+                textAlign: TextAlign.center,
+                style: rowTextStyle,
+              ),
+            ),
+            Expanded(
+              flex: 2,
+              child: Text(
+                amount.toStringAsFixed(2),
+                textAlign: TextAlign.center,
+                style: rowTextStyle,
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+Widget _billReceiptTableSection(
+  BillRecord bill,
+  List<Map<String, dynamic>> rows, {
+  String drawFilter = 'ALL',
+  void Function(int index)? onRowLongPress,
+}) {
+  return Container(
+    decoration: BoxDecoration(
+      border: Border.all(color: Colors.grey.shade400),
+    ),
+    child: Column(
+      children: [
+        _billReceiptTableHeaderRow(),
+        ...rows.asMap().entries.map(
+              (entry) => _billReceiptDataRow(
+                bill: bill,
+                row: entry.value,
+                drawFilter: drawFilter,
+                onLongPress: onRowLongPress == null
+                    ? null
+                    : () => onRowLongPress(entry.key),
+              ),
+            ),
+      ],
+    ),
+  );
+}
+
+Widget _billReceiptDetailsPanel(
+  BillRecord bill,
+  List<Map<String, dynamic>> rows, {
+  String drawFilter = 'ALL',
+  void Function(int index)? onRowLongPress,
+}) {
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      _billReceiptMetaSection(bill),
+      _billReceiptTableSection(
+        bill,
+        rows,
+        drawFilter: drawFilter,
+        onRowLongPress: onRowLongPress,
+      ),
+    ],
+  );
 }
 
 Widget _salesDrawBar({
@@ -4693,13 +5160,19 @@ Widget _reportPage({
   required String title,
   required Widget body,
   VoidCallback? onBack,
+  Color? appBarColor,
 }) {
   return Scaffold(
     body: Container(
       decoration: _reportPageBgDecoration(),
       child: Scaffold(
         backgroundColor: Colors.transparent,
-        appBar: _reportAppBar(title, context, onBack: onBack),
+        appBar: _reportAppBar(
+          title,
+          context,
+          onBack: onBack,
+          backgroundColor: appBarColor,
+        ),
         body: body,
       ),
     ),
@@ -4936,6 +5409,9 @@ class _EditUserPageState extends State<EditUserPage> {
 
     if (success) {
       await UserStore.persistNow();
+      if (AppSession.role == 'ADMIN') {
+        await SyncService.flushQueue();
+      }
     }
 
     if (!mounted) return;
@@ -7313,7 +7789,7 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        backgroundColor: kResultClassicHeaderBlue,
+        backgroundColor: kAppHeaderColor,
         foregroundColor: Colors.white,
         elevation: 0,
         title: Text(
@@ -7348,7 +7824,7 @@ class _EditDearResultPageState extends State<EditDearResultPage> {
               onPressed: _save,
               style: FilledButton.styleFrom(
                 backgroundColor: Colors.white,
-                foregroundColor: kResultClassicHeaderBlue,
+                foregroundColor: kAppHeaderColor,
               ),
               child: const Text("SAVE"),
             ),
@@ -7825,6 +8301,7 @@ class _DearResultPageState extends State<DearResultPage> {
       height: cardHeight,
       timeLabel: resultDrawCompactTime(_selectedDraw),
       dateLabel: resultDateFieldLabel(_resultDate),
+      searchButtonColor: _drawThemeColor(_selectedDraw),
       bookingWhatsappPhone: BookingContactStore.whatsappPhone.value,
       showBookingWhatsappBar: _showBookingWhatsappRow,
       prizes: List<String>.from(_prizeValues),
@@ -7969,7 +8446,10 @@ class _DearResultPageState extends State<DearResultPage> {
   @override
   void initState() {
     super.initState();
-    _resultDate = calendarTodayInIndia();
+    final istNow = DearAutoResultService.nowInIndia();
+    _selectedDraw = DrawScheduleStore.currentUiDraw(at: istNow);
+    _resultDate = DrawScheduleStore.currentUiDrawResultDate(at: istNow);
+    AppDrawTheme.setDraw(_selectedDraw);
     unawaited(_bootstrapResultView());
     ResultStore.results.addListener(_onResultStoreChanged);
     SyncService.restoring.addListener(_onRestoreChanged);
@@ -8028,22 +8508,24 @@ class _DearResultPageState extends State<DearResultPage> {
     );
     if (picked == null || !mounted) return;
     setState(() => _selectedDraw = picked);
+    AppDrawTheme.setDraw(picked);
     _onDrawOrDateChanged();
   }
 
   @override
   Widget build(BuildContext context) {
     final bool loading = SyncService.restoring.value;
+    final drawColor = _drawThemeColor(_selectedDraw);
     return Stack(
       children: [
         Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        backgroundColor: kResultClassicHeaderBlue,
+        backgroundColor: kAppHeaderColor,
         foregroundColor: Colors.white,
         elevation: 0,
-        systemOverlayStyle: const SystemUiOverlayStyle(
-          statusBarColor: kResultClassicHeaderBlue,
+        systemOverlayStyle: SystemUiOverlayStyle(
+          statusBarColor: kAppHeaderColor,
           statusBarIconBrightness: Brightness.light,
           statusBarBrightness: Brightness.dark,
         ),
@@ -8136,6 +8618,7 @@ class _DearResultPageState extends State<DearResultPage> {
             const SizedBox(height: 10),
             Center(
               child: ResultWinningNumbersSearchButton(
+                color: drawColor,
                 loading: _fetchingCloud,
                 onPressed: () =>
                     _refreshCurrentDrawResult(userTriggered: true),
@@ -8321,7 +8804,6 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
   @override
   Widget build(BuildContext context) {
     final selectedDraw = widget.selectedDraw;
-    final drawColor = menuDrawColor(selectedDraw);
     final close = DrawScheduleStore.drawCloseTimeLabel(selectedDraw);
     final drawAt = _menuDrawResultTimeLabel(selectedDraw);
     final open =
@@ -8334,15 +8816,18 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
 
     return Container(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.zero,
-        border: Border.all(color: Colors.white, width: 2),
+        gradient: LinearGradient(
+          begin: Alignment.topRight,
+          end: Alignment.bottomLeft,
+          colors: _drawGradientForTime(selectedDraw),
+        ),
       ),
       clipBehavior: Clip.antiAlias,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Material(
-            color: drawColor,
+            color: Colors.transparent,
             child: InkWell(
               onTap: allowed.length > 1
                   ? () => setState(() => _expanded = !_expanded)
@@ -8360,7 +8845,7 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
                             menuDrawShortLabel(selectedDraw),
                             style: const TextStyle(
                               fontWeight: FontWeight.w800,
-                              fontSize: 17,
+                              fontSize: 20,
                               color: Colors.white,
                             ),
                           ),
@@ -8374,17 +8859,29 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
                             ),
                           ),
                           if (open && countdown != null) ...[
-                            const SizedBox(height: 3),
-                            Text(
-                              'Closes in $countdown',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.white.withValues(alpha: 0.88),
-                              ),
+                            const SizedBox(height: 4),
+                            Row(
+                              children: [
+                                Icon(
+                                  Icons.schedule,
+                                  size: 13,
+                                  color:
+                                      Colors.white.withValues(alpha: 0.88),
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  'Closes in $countdown',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color:
+                                        Colors.white.withValues(alpha: 0.88),
+                                  ),
+                                ),
+                              ],
                             ),
                           ] else if (!open) ...[
-                            const SizedBox(height: 3),
+                            const SizedBox(height: 4),
                             Text(
                               AppMsg.bookingClosedStatus,
                               style: TextStyle(
@@ -8400,10 +8897,10 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
                     if (allowed.length > 1)
                       Icon(
                         _expanded
-                            ? Icons.arrow_drop_up
-                            : Icons.arrow_drop_down,
+                            ? Icons.keyboard_arrow_up
+                            : Icons.keyboard_arrow_down,
                         color: Colors.white,
-                        size: 30,
+                        size: 28,
                       ),
                   ],
                 ),
@@ -8412,16 +8909,16 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
           ),
           if (_expanded)
             ColoredBox(
-              color: kAppBlue,
+              color: kAppBlueDark,
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+                padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     for (int i = 0; i < allowed.length; i++)
                       Padding(
                         padding: EdgeInsets.only(
-                          bottom: i == allowed.length - 1 ? 0 : 8,
+                          top: i == 0 ? 0 : 8,
                         ),
                         child: Material(
                           color: menuDrawColor(allowed[i]),
@@ -8433,20 +8930,14 @@ class _MenuDrawSelectorState extends State<_MenuDrawSelector> {
                             child: Container(
                               width: double.infinity,
                               padding:
-                                  const EdgeInsets.symmetric(vertical: 16),
-                              decoration: BoxDecoration(
-                                border: Border.all(
-                                  color: Colors.white,
-                                  width: 2,
-                                ),
-                              ),
+                                  const EdgeInsets.symmetric(vertical: 14),
                               child: Text(
                                 menuDrawShortLabel(allowed[i]),
                                 textAlign: TextAlign.center,
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontWeight: FontWeight.w800,
-                                  fontSize: 17,
+                                  fontSize: 16,
                                 ),
                               ),
                             ),
@@ -8545,57 +9036,70 @@ class _ReportsPageState extends State<ReportsPage> {
         child: Scaffold(
           backgroundColor: Colors.transparent,
           appBar: _reportAppBar("Reports", context),
-          body: ListView(
-            padding: const EdgeInsets.all(12),
-            children: [
-              _simpleMenuCard([
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.calculate_outlined,
-                  title: 'Sales Report',
-                  onTap: () => Navigator.push(
+          body: ValueListenableBuilder<String>(
+            valueListenable: AppDrawTheme.activeDraw,
+            builder: (context, activeDraw, _) {
+              return ListView(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+                children: [
+                  _homeMenuTile(
                     context,
-                    appRoute(const SalesReportPage()),
+                    icon: Icons.calculate_outlined,
+                    title: 'Sales Report',
+                    subtitle: 'View sales bills and totals by date',
+                    iconColor: AppDrawTheme.color,
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const SalesReportPage()),
+                    ),
                   ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.emoji_events_outlined,
-                  title: 'Winnings Report',
-                  onTap: () => Navigator.push(
+                  _homeMenuTile(
                     context,
-                    appRoute(const WinningReportPage()),
+                    icon: Icons.emoji_events_outlined,
+                    title: 'Winnings Report',
+                    subtitle: 'View winning tickets and prize amounts',
+                    iconColor: AppDrawTheme.color,
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const WinningReportPage()),
+                    ),
                   ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.receipt_long_outlined,
-                  title: 'Winning Bill Wise',
-                  onTap: () => Navigator.push(
+                  _homeMenuTile(
                     context,
-                    appRoute(const WinningBillWiseSearchPage()),
+                    icon: Icons.receipt_long_outlined,
+                    title: 'Winning Bill Wise',
+                    subtitle: 'Find winnings for a specific bill',
+                    iconColor: AppDrawTheme.color,
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const WinningBillWiseSearchPage()),
+                    ),
                   ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.account_balance_wallet_outlined,
-                  title: 'Net Pay',
-                  onTap: () => Navigator.push(
+                  _homeMenuTile(
                     context,
-                    appRoute(const NetPayPage()),
+                    icon: Icons.account_balance_wallet_outlined,
+                    title: 'Net Pay',
+                    subtitle: 'View net pay and commission summary',
+                    iconColor: AppDrawTheme.color,
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const NetPayPage()),
+                    ),
                   ),
-                ),
-                _simpleMenuTile(
-                  context,
-                  icon: Icons.format_list_numbered_outlined,
-                  title: 'Number Wise',
-                  onTap: () => Navigator.push(
+                  _homeMenuTile(
                     context,
-                    appRoute(const NumberWiseReportPage()),
+                    icon: Icons.format_list_numbered_outlined,
+                    title: 'Number Wise',
+                    subtitle: 'View sales breakdown by number',
+                    iconColor: AppDrawTheme.color,
+                    onTap: () => Navigator.push(
+                      context,
+                      appRoute(const NumberWiseReportPage()),
+                    ),
                   ),
-                ),
-              ]),
-            ],
+                ],
+              );
+            },
           ),
         ),
       ),
@@ -8658,7 +9162,11 @@ class _WinningReportPageState extends State<WinningReportPage> {
 
   @override
   Widget build(BuildContext context) {
-    return _reportPage(context: context, title: "Winning Report", body: ValueListenableBuilder<List<BillRecord>>(
+    final chromeColor = _reportDrawChromeColor(drawFilter);
+    return _reportPage(
+      context: context,
+      title: "Winning Report",
+      body: ValueListenableBuilder<List<BillRecord>>(
         valueListenable: BillsStore.bills,
         builder: (context, bills, _) {
           return SingleChildScrollView(
@@ -8750,6 +9258,7 @@ class _WinningReportPageState extends State<WinningReportPage> {
                           );
                         },
                         flat: true,
+                        color: chromeColor,
                         child: const Text("View Bills"),
                       ),
                     ],
@@ -8783,17 +9292,24 @@ class WinningDetailsPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final totals = _totals();
     final drawColor = _salesDrawColor(drawFilter);
+    final chromeColor = _reportDrawChromeColor(drawFilter);
     final allWinningRows = _allWinningRowsFromBills(
       filteredBills,
       drawFilter: drawFilter,
     );
 
     if (filteredBills.isEmpty) {
-      return _reportPage(context: context, title: "Winning Details", body: const _WinningReportEmptyBody(),
+      return _reportPage(
+        context: context,
+        title: "Winning Details",
+        body: const _WinningReportEmptyBody(),
       );
     }
 
-    return _reportPage(context: context, title: "Winning Details", body: ListView(
+    return _reportPage(
+      context: context,
+      title: "Winning Details",
+      body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
           Container(
@@ -8906,7 +9422,11 @@ class _WinningBillWiseSearchPageState extends State<WinningBillWiseSearchPage> {
 
   @override
   Widget build(BuildContext context) {
-    return _reportPage(context: context, title: "Winning Bill Wise", body: ValueListenableBuilder<List<BillRecord>>(
+    final chromeColor = _reportDrawChromeColor(drawFilter);
+    return _reportPage(
+      context: context,
+      title: "Winning Bill Wise",
+      body: ValueListenableBuilder<List<BillRecord>>(
         valueListenable: BillsStore.bills,
         builder: (context, bills, _) {
           return SingleChildScrollView(
@@ -8979,6 +9499,7 @@ class _WinningBillWiseSearchPageState extends State<WinningBillWiseSearchPage> {
                             ),
                           );
                         },
+                        color: chromeColor,
                         child: const Text("View Bills"),
                       ),
                     ],
@@ -9027,6 +9548,7 @@ class _NetPayPageState extends State<NetPayPage> {
 
   @override
   Widget build(BuildContext context) {
+    final chromeColor = _reportDrawChromeColor(drawFilter);
     return _reportPage(
       context: context,
       title: "Net Pay",
@@ -9118,6 +9640,7 @@ class _NetPayPageState extends State<NetPayPage> {
                           );
                         },
                         flat: true,
+                        color: chromeColor,
                         child: const Text("Generate Report"),
                       ),
                     ],
@@ -9193,6 +9716,7 @@ class NetPayResultPage extends StatelessWidget {
     final userTotals = _userTotals();
     final tint = _salesDrawTint(drawFilter);
     final sortedUsers = userTotals.keys.toList()..sort();
+    final chromeColor = _reportDrawChromeColor(drawFilter);
 
     return _reportPage(
       context: context,
@@ -9216,7 +9740,7 @@ class NetPayResultPage extends StatelessWidget {
                       style: TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w600,
-                        color: _salesDrawColor(drawFilter),
+                        color: kAppBlue,
                       ),
                     ),
                   ),
@@ -9225,7 +9749,7 @@ class NetPayResultPage extends StatelessWidget {
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w700,
-                      color: _salesDrawColor(drawFilter),
+                      color: kAppBlue,
                     ),
                   ),
                 ],
@@ -9468,6 +9992,7 @@ class _NumberWiseReportPageState extends State<NumberWiseReportPage> {
 
   @override
   Widget build(BuildContext context) {
+    final chromeColor = _reportDrawChromeColor(drawFilter);
     return _reportPage(
       context: context,
       title: "Number Wise Report",
@@ -9574,6 +10099,7 @@ class _NumberWiseReportPageState extends State<NumberWiseReportPage> {
                             ),
                           );
                         },
+                        color: chromeColor,
                         child: const Text("Generate Report"),
                       ),
                     ],
@@ -9617,6 +10143,7 @@ class NumberWiseResultPage extends StatelessWidget {
     final int total =
         rows.fold<int>(0, (s, r) => s + ((r["count"] as int?) ?? 0));
     final tint = _salesDrawTint(drawFilter);
+    final chromeColor = _reportDrawChromeColor(drawFilter);
 
     if (rows.isEmpty) {
       return _reportPage(
@@ -9675,7 +10202,7 @@ class NumberWiseResultPage extends StatelessWidget {
                           style: TextStyle(
                             fontSize: 13,
                             fontWeight: FontWeight.w600,
-                            color: _salesDrawColor(drawFilter),
+                            color: kAppBlue,
                           ),
                         ),
                       ),
@@ -9691,7 +10218,7 @@ class NumberWiseResultPage extends StatelessWidget {
                           style: TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w700,
-                            color: _salesDrawColor(drawFilter),
+                            color: kAppBlue,
                           ),
                         ),
                       ),
@@ -9817,7 +10344,7 @@ class NumberWiseResultPage extends StatelessWidget {
             ),
           ),
           DecoratedBox(
-            decoration: const BoxDecoration(color: kAppBlue),
+            decoration: BoxDecoration(color: chromeColor),
             child: SafeArea(
               top: false,
               child: Padding(
@@ -9918,7 +10445,11 @@ class _SalesReportPageState extends State<SalesReportPage> {
 
   @override
   Widget build(BuildContext context) {
-    return _reportPage(context: context, title: "Sales Report", body: ValueListenableBuilder<List<BillRecord>>(
+    final chromeColor = _reportDrawChromeColor(drawFilter);
+    return _reportPage(
+      context: context,
+      title: "Sales Report",
+      body: ValueListenableBuilder<List<BillRecord>>(
         valueListenable: BillsStore.bills,
         builder: (context, bills, _) {
           return SingleChildScrollView(
@@ -9993,6 +10524,7 @@ class _SalesReportPageState extends State<SalesReportPage> {
                           );
                         },
                         flat: true,
+                        color: chromeColor,
                         child: const Text("View Bills"),
                       ),
                     ],
@@ -10252,13 +10784,6 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
     }
   }
 
-  Color _salesDetailRowColor(String type) {
-    final code = widget.drawFilter != 'ALL'
-        ? widget.drawFilter
-        : _drawCodeFromRowType(type);
-    return _salesDrawColor(code);
-  }
-
   Widget _salesReportFooter({
     required int count,
     required double amount,
@@ -10334,73 +10859,6 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
                 totalCell('COUNT', count.toStringAsFixed(2)),
                 totalCell('AMOUNT', formatSalesAmount(amount)),
               ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _salesExpandedLineRow(Map<String, dynamic> row) {
-    final type = row['type'].toString();
-    final count = row['count'].toString();
-    final amount = BillRecord.readRowAmount(row['amount']);
-    final rowColor = _salesDetailRowColor(type);
-    const lineStyle = TextStyle(
-      fontSize: 15,
-      fontWeight: FontWeight.w700,
-      color: Colors.white,
-    );
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(
-        color: rowColor,
-        border: Border(
-          bottom: BorderSide(
-            color: Colors.white.withValues(alpha: 0.28),
-            width: 0.5,
-          ),
-          left: BorderSide(
-            color: Colors.white.withValues(alpha: 0.18),
-            width: 0.5,
-          ),
-          right: BorderSide(
-            color: Colors.white.withValues(alpha: 0.18),
-            width: 0.5,
-          ),
-        ),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            flex: 3,
-            child: Text(
-              _salesRowTypeDisplayLabel(type),
-              style: lineStyle,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          Expanded(
-            flex: 2,
-            child: Text(
-              row['number'].toString(),
-              textAlign: TextAlign.center,
-              style: lineStyle,
-            ),
-          ),
-          Expanded(
-            child: Text(
-              count,
-              textAlign: TextAlign.center,
-              style: lineStyle,
-            ),
-          ),
-          Expanded(
-            flex: 2,
-            child: Text(
-              amount.toStringAsFixed(2),
-              textAlign: TextAlign.end,
-              style: lineStyle,
             ),
           ),
         ],
@@ -10525,10 +10983,13 @@ class _SalesReportDetailedPageState extends State<SalesReportDetailedPage> {
           ),
         ),
         if (expanded)
-          Column(
-            children: rows.asMap().entries.map(
-                  (e) => _salesExpandedLineRow(e.value),
-                ).toList(),
+          ColoredBox(
+            color: Colors.white,
+            child: _billReceiptDetailsPanel(
+              displayBill,
+              rows,
+              drawFilter: widget.drawFilter,
+            ),
           ),
         Divider(height: 1, thickness: 1, color: Colors.grey.shade300),
       ],
@@ -10825,12 +11286,7 @@ class _EditBillPageState extends State<EditBillPage> {
     BillsStore.notifyUpdated(selectedBill);
   }
 
-  String _formatDate(DateTime dt) {
-    final local = dt.toLocal();
-    return "${local.year.toString().padLeft(4, "0")}-"
-        "${local.month.toString().padLeft(2, "0")}-"
-        "${local.day.toString().padLeft(2, "0")}";
-  }
+  String _formatDate(DateTime dt) => _formatBillBusinessDate(dt);
 
   String _formatTime(DateTime dt) {
     final int hour12 = dt.hour % 12 == 0 ? 12 : dt.hour % 12;
@@ -10853,54 +11309,6 @@ class _EditBillPageState extends State<EditBillPage> {
     return bill.drawTimeName;
   }
 
-  String _formatSaleTime(DateTime dt) {
-    final local = dt.toLocal();
-    return "${local.hour.toString().padLeft(2, "0")}:"
-        "${local.minute.toString().padLeft(2, "0")}:"
-        "${local.second.toString().padLeft(2, "0")}";
-  }
-
-  String _billDrawShort(String drawName) {
-    switch (drawName.trim()) {
-      case 'DEAR 1 PM':
-        return '1PM';
-      case 'LSK 3 PM':
-        return '3PM';
-      case 'DEAR 6 PM':
-        return '6PM';
-      case 'DEAR 8 PM':
-        return '8PM';
-      default:
-        return drawName.replaceAll(' ', '');
-    }
-  }
-
-  String _billTicketLabel(String type, String drawName) {
-    final i = type.lastIndexOf('-');
-    final suffix = i >= 0 ? type.substring(i + 1).toUpperCase() : type.toUpperCase();
-    final drawShort = _billDrawShort(drawName);
-    switch (suffix) {
-      case 'SUPER':
-        return 'Super-$drawShort';
-      case 'BOX':
-        return 'Box-$drawShort';
-      case 'A':
-        return 'A-$drawShort';
-      case 'B':
-        return 'B-$drawShort';
-      case 'C':
-        return 'C-$drawShort';
-      case 'AB':
-        return 'AB-$drawShort';
-      case 'BC':
-        return 'BC-$drawShort';
-      case 'AC':
-        return 'AC-$drawShort';
-      default:
-        return type;
-    }
-  }
-
   String _formatBillFooterAmount(double value) {
     if ((value - value.roundToDouble()).abs() < 0.001) {
       return value.round().toString();
@@ -10908,50 +11316,11 @@ class _EditBillPageState extends State<EditBillPage> {
     return value.toStringAsFixed(1);
   }
 
-  Widget _billMetaLabelValue(String label, String value,
-      {TextAlign align = TextAlign.start}) {
-    return RichText(
-      textAlign: align,
-      text: TextSpan(
-        style: const TextStyle(fontSize: 14, color: Color(0xFF212121)),
-        children: [
-          TextSpan(text: '$label : '),
-          TextSpan(
-            text: value,
-            style: const TextStyle(fontWeight: FontWeight.w800),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _billDrawDisplayName(String draw) => menuDrawShortLabel(draw);
-
-  Color _billRowDrawColor(BillRecord bill, String rowType) {
-    final code = _drawCodeFromRowType(rowType);
-    if (code != 'ALL') return _salesDrawColor(code);
-    final fromDraw = _drawCodeFromFilter(bill.effectiveDrawName);
-    if (fromDraw.isNotEmpty) return _salesDrawColor(fromDraw);
-    return _drawColorForTime(bill.effectiveDrawName);
-  }
-
-  Color _billFooterDrawColor(BillRecord bill) {
-    final fromDraw = _drawCodeFromFilter(bill.effectiveDrawName);
-    if (fromDraw.isNotEmpty) return _salesDrawColor(fromDraw);
-    if (bill.rows.isNotEmpty) {
-      return _billRowDrawColor(bill, bill.rows.first['type'].toString());
-    }
-    return kAppBlue;
-  }
-
   Widget _buildBillDetailsView(BillRecord bill) {
-    const tableHeader = Color(0xFF616161);
-    final billNote = bill.billNote;
-
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        backgroundColor: kAppBlue,
+        backgroundColor: kAppHeaderColor,
         foregroundColor: Colors.white,
         elevation: 0,
         surfaceTintColor: Colors.transparent,
@@ -10997,208 +11366,10 @@ class _EditBillPageState extends State<EditBillPage> {
                         ),
                       ),
                     ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: _billMetaLabelValue(
-                            'Bil NO',
-                            bill.billNo.toString(),
-                          ),
-                        ),
-                        Expanded(
-                          child: _billMetaLabelValue(
-                            'Draw Date',
-                            _formatDate(bill.businessDate),
-                            align: TextAlign.end,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: _billMetaLabelValue(
-                            'Draw',
-                            _billDrawDisplayName(bill.effectiveDrawName),
-                          ),
-                        ),
-                        Expanded(
-                          child: _billMetaLabelValue(
-                            'Sale Time',
-                            _formatSaleTime(bill.createdAt),
-                            align: TextAlign.end,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: _billMetaLabelValue('A', bill.username),
-                        ),
-                        Expanded(
-                          child: Align(
-                            alignment: Alignment.centerRight,
-                            child: _billMetaLabelValue(
-                              'Bill Note',
-                              billNote.isNotEmpty ? billNote : '',
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Divider(height: 1, color: Colors.grey.shade300),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-                    child: _billMetaLabelValue('SA', bill.username),
-                  ),
-                  Container(
-                    decoration: BoxDecoration(
-                      border: Border.all(color: Colors.grey.shade400),
-                    ),
-                    child: Column(
-                      children: [
-                        Container(
-                          color: tableHeader,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 8,
-                          ),
-                          child: const Row(
-                            children: [
-                              Expanded(
-                                flex: 3,
-                                child: Text(
-                                  'Ticket',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                    fontSize: 14,
-                                  ),
-                                ),
-                              ),
-                              Expanded(
-                                flex: 2,
-                                child: Text(
-                                  'Number',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                    fontSize: 14,
-                                  ),
-                                ),
-                              ),
-                              Expanded(
-                                flex: 2,
-                                child: Text(
-                                  'Count',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                    fontSize: 14,
-                                  ),
-                                ),
-                              ),
-                              Expanded(
-                                flex: 2,
-                                child: Text(
-                                  'Amount',
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w700,
-                                    fontSize: 14,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        ...bill.rows.asMap().entries.map((entry) {
-                          final index = entry.key;
-                          final row = entry.value;
-                          final amount =
-                              BillRecord.readRowAmount(row['amount']);
-                          final rowColor = _billRowDrawColor(
-                            bill,
-                            row['type'].toString(),
-                          );
-                          const rowTextStyle = TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w700,
-                            color: Colors.white,
-                          );
-                          return Material(
-                            color: rowColor,
-                            child: InkWell(
-                              onLongPress: () => _showBillRowOptions(index),
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  border: Border(
-                                    top: BorderSide(
-                                      color: Colors.white.withValues(alpha: 0.28),
-                                    ),
-                                  ),
-                                ),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 8,
-                                ),
-                                child: Row(
-                                  children: [
-                                    Expanded(
-                                      flex: 3,
-                                      child: Text(
-                                        _billTicketLabel(
-                                          row['type'].toString(),
-                                          bill.effectiveDrawName,
-                                        ),
-                                        style: rowTextStyle,
-                                      ),
-                                    ),
-                                    Expanded(
-                                      flex: 2,
-                                      child: Text(
-                                        row['number'].toString(),
-                                        textAlign: TextAlign.center,
-                                        style: rowTextStyle,
-                                      ),
-                                    ),
-                                    Expanded(
-                                      flex: 2,
-                                      child: Text(
-                                        row['count'].toString(),
-                                        textAlign: TextAlign.center,
-                                        style: rowTextStyle,
-                                      ),
-                                    ),
-                                    Expanded(
-                                      flex: 2,
-                                      child: Text(
-                                        amount.toStringAsFixed(2),
-                                        textAlign: TextAlign.center,
-                                        style: rowTextStyle,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
-                        }),
-                      ],
-                    ),
+                  _billReceiptDetailsPanel(
+                    bill,
+                    bill.rows,
+                    onRowLongPress: _showBillRowOptions,
                   ),
                 ],
               ),
@@ -11206,7 +11377,7 @@ class _EditBillPageState extends State<EditBillPage> {
           ),
           Container(
             decoration: BoxDecoration(
-              color: _billFooterDrawColor(bill),
+              color: _billReceiptFooterDrawColor(bill),
               border: Border(
                 top: BorderSide(
                   color: Colors.white.withValues(alpha: 0.28),
@@ -11538,6 +11709,7 @@ class _TicketPageState extends State<TicketPage> {
   final List<Map<String, dynamic>> selectedEntries = [];
   late Timer _clockTimer;
   DateTime _now = DateTime.now();
+  bool _lastSalesBlocked = false;
 
   bool get isSingleDigitMode => selectedOption == "1";
   bool get isDoubleDigitMode => selectedOption == "2";
@@ -11574,10 +11746,7 @@ class _TicketPageState extends State<TicketPage> {
   /// Start / End / Count labels only when Range, Range 2, 100, or 111 is on.
   bool get _usesStartEndCountLayout => isRangeMode;
   bool get showThirdField => isTripleMode || isRangeMode;
-  static const List<Color> _saveButtonGradient = [
-    kAppBlue,
-    kAppBlueDark,
-  ];
+  static List<Color> get _saveButtonGradient => AppDrawTheme.gradient;
   static const double _bookingToolbarHeight = 40;
   static const Color _bookingBarBlue = kAppBlue;
   static const Color _bookingDearGreen = Color(0xFF43A047);
@@ -11585,8 +11754,8 @@ class _TicketPageState extends State<TicketPage> {
   static const Color _bookingAllOrange = Color(0xFFEF6C00);
   static const Color _bookingSegmentAll = Color(0xFFD84315);
 
-  /// Page chrome follows selected draw; action rows keep legacy colors.
-  Color get _bookingPageColor => menuDrawColor(selectedTime);
+  /// Page chrome follows the draw selected on this page (not global menu theme).
+  Color get _bookingPageColor => _bookingDrawButtonColor(selectedTime);
 
   Color _bookingDrawButtonColor(String draw) => menuDrawColor(draw);
 
@@ -11757,35 +11926,60 @@ class _TicketPageState extends State<TicketPage> {
   }
 
   Widget _bookingStatsRow() {
-    return Row(
+    const totalStyle = TextStyle(
+      color: Colors.white,
+      fontWeight: FontWeight.w700,
+      fontSize: 14,
+    );
+    return Column(
       children: [
-        Expanded(
-          child: Text(
-            'COUNT :${_totalCount()}',
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-              fontSize: 15,
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'COUNT :${_totalCount()}',
+                style: totalStyle,
+              ),
             ),
-          ),
+            _headerDigitBtn('1'),
+            _headerDigitBtn('2'),
+            _headerDigitBtn('3'),
+          ],
         ),
-        Expanded(
-          child: Text(
-            'Rs : ${_totalAmount().toStringAsFixed(1)}',
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-              fontSize: 15,
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Agent Rs : ${_totalAmount().toStringAsFixed(1)}',
+                style: totalStyle,
+              ),
             ),
-          ),
+            Expanded(
+              child: Text(
+                'Customer Rs : ${_totalCustomerAmount().toStringAsFixed(1)}',
+                textAlign: TextAlign.end,
+                style: totalStyle,
+              ),
+            ),
+          ],
         ),
-        _headerDigitBtn('1'),
-        _headerDigitBtn('2'),
-        _headerDigitBtn('3'),
       ],
     );
   }
+
+  double _customerRateForType(String type) => getRetailRate(type);
+
+  double _customerAmountForType(String type, int count) {
+    if (count <= 0) return 0;
+    return bookingAmountFromRate(_customerRateForType(type), count);
+  }
+
+  double _totalCustomerAmount() => selectedEntries.fold<double>(0, (total, row) {
+        final count = int.tryParse(row['count']?.toString() ?? '') ?? 0;
+        return total +
+            _customerAmountForType(row['type']?.toString() ?? '', count);
+      });
 
   Widget _headerDigitBtn(String text) {
     final bool isSelected = selectedOption == text;
@@ -11862,6 +12056,7 @@ class _TicketPageState extends State<TicketPage> {
                       child: InkWell(
                         onTap: () {
                           setState(() => selectedTime = allowed[i]);
+                          AppDrawTheme.setDraw(allowed[i]);
                           Navigator.pop(dialogContext);
                         },
                         child: Container(
@@ -12238,11 +12433,13 @@ class _TicketPageState extends State<TicketPage> {
     }
   }
 
+  String _drawCompactPmLabel(String time) => '${_rowDrawHour(time)}PM';
+
   String _actionBtnLabel(String text) {
     if (text == 'BOTH' || text == 'ALL') return 'ALL';
     final suffix = _actionBtnSuffix(text);
     final drawLabel = _drawActionLabel(selectedTime);
-    if (suffix == 'SUPER') return '$drawLabel DEAR';
+    if (suffix == 'SUPER') return '${_drawCompactPmLabel(selectedTime)} SUPER';
     if (suffix == 'BOX') return '$drawLabel BOX';
     return suffix;
   }
@@ -12275,7 +12472,7 @@ class _TicketPageState extends State<TicketPage> {
   String _rowTypeDisplay(String type) {
     final suffix = _rowTypeSuffix(type);
     final drawLabel = _drawActionLabel(selectedTime);
-    if (suffix == 'SUPER') return '$drawLabel DEAR';
+    if (suffix == 'SUPER') return '${_drawCompactPmLabel(selectedTime)} SUPER';
     if (suffix == 'BOX') return '$drawLabel BOX';
     final letter = _rowDrawLetter(selectedTime);
     final hour = _rowDrawHour(selectedTime);
@@ -12300,16 +12497,32 @@ class _TicketPageState extends State<TicketPage> {
   void initState() {
     super.initState();
     final allowed = _allowedDrawsForUser(widget.username);
-    if (allowed.contains(widget.title.trim())) {
+    final globalDraw = AppDrawTheme.activeDraw.value;
+    if (allowed.contains(globalDraw)) {
+      selectedTime = globalDraw;
+    } else if (allowed.contains(widget.title.trim()) &&
+        widget.title.trim().isNotEmpty) {
       selectedTime = widget.title.trim();
     } else if (allowed.isNotEmpty) {
       selectedTime = allowed.first;
     } else {
       selectedTime = _menuDrawForUser(widget.username, at: _now);
     }
-    AppDrawTheme.refreshForUser(widget.username);
+    AppDrawTheme.setDraw(selectedTime);
+    _lastSalesBlocked = _salesBlocked;
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
+      if (UserStore.isLoginBlocked(widget.username)) {
+        logoutApp(context);
+        return;
+      }
+      final blocked = _salesBlocked;
+      if (blocked && !_lastSalesBlocked) {
+        _showSalesBlockedMessage();
+        Navigator.pop(context);
+        return;
+      }
+      _lastSalesBlocked = blocked;
       setState(() => _now = DateTime.now());
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -12539,7 +12752,7 @@ class _TicketPageState extends State<TicketPage> {
   String _segmentBtnLabel(String actionKey) {
     if (actionKey == 'ALL' || actionKey == 'BOTH') return 'ALL';
     final suffix = _actionBtnSuffix(actionKey);
-    if (suffix == 'SUPER') return '${_drawActionLabel(selectedTime)} DEAR';
+    if (suffix == 'SUPER') return '${_drawCompactPmLabel(selectedTime)} SUPER';
     if (suffix == 'BOX') return '${_drawActionLabel(selectedTime)} BOX';
     final letter = _rowDrawLetter(selectedTime);
     final hour = _rowDrawHour(selectedTime);
@@ -12736,69 +12949,8 @@ class _TicketPageState extends State<TicketPage> {
     if (!_ensureCanSell()) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     final String raw = (data?.text ?? "").trim();
-    if (raw.isEmpty) {
-      if (!mounted) return;
-      showErrorSnack(context, AppMsg.clipboardEmpty);
-      return;
-    }
-
-    // Try WhatsApp Full Parser first
-    if (raw.contains('\n') || raw.contains('*') || raw.length > 50) {
-      if (_handleWhatsAppPaste(raw)) return;
-    }
-
-    final String cleaned = _stripWhatsAppMetadata(raw);
-    final String inferredMode = _inferImportMode(cleaned);
-    if (inferredMode == "2" && selectedOption != "2") {
-      setState(() {
-        selectedOption = "2";
-        range = false;
-        range2 = false;
-        set = false;
-        n100 = false;
-        n111 = false;
-      });
-    } else if (inferredMode == "1" && selectedOption != "1") {
-      setState(() {
-        selectedOption = "1";
-        range = false;
-        range2 = false;
-        set = false;
-        n100 = false;
-        n111 = false;
-      });
-    } else if (inferredMode == "3" && selectedOption != "3") {
-      setState(() {
-        selectedOption = "3";
-        range = false;
-        range2 = false;
-        set = false;
-        n100 = false;
-        n111 = false;
-      });
-    }
-
-    final List<Map<String, dynamic>> rows = _parseClipboardRows(raw);
-    if (rows.isEmpty) {
-      if (!mounted) return;
-      showErrorSnack(context, AppMsg.clipboardFormatError);
-      return;
-    }
-
-    setState(() {
-      for (final row in rows.reversed) {
-        selectedEntries.insert(0, row);
-      }
-      final String? lastNumber =
-          rows.isNotEmpty ? rows.last["number"]?.toString() : null;
-      final int len = lastNumber?.length ?? 0;
-      if (len == 1) selectedOption = "1";
-      if (len == 2) selectedOption = "2";
-      if (len >= 3) selectedOption = "3";
-    });
-
     if (!mounted) return;
-    showSuccessSnack(context, AppMsg.entriesAdded(rows.length));
+    await _openWhatsAppPastePreview(raw);
   }
 
   String _inferImportMode(String cleanedText) {
@@ -14021,6 +14173,7 @@ class _TicketPageState extends State<TicketPage> {
       padding: EdgeInsets.zero,
       onSelected: (draw) {
         setState(() => selectedTime = draw);
+        AppDrawTheme.setDraw(draw);
       },
       itemBuilder: (context) => [
         for (final draw in allowed)
@@ -14048,25 +14201,17 @@ class _TicketPageState extends State<TicketPage> {
 
   bool autoSubmit = false;
 
-  bool _handleWhatsAppPaste(String text) {
-    if (!_ensureCanSell()) return false;
-    final result = parseWhatsAppFull(text);
-    final List<Booking> bookings = result['bookings'];
-    if (bookings.isEmpty) return false;
-
+  void _addWhatsAppBookings(List<Booking> bookings, {String? customerName}) {
+    if (bookings.isEmpty) return;
     setState(() {
-      final name = result['name']?.toString().trim() ?? '';
+      final name = customerName?.trim() ?? '';
       if (name.isNotEmpty) customerNameController.text = name;
       final String code = _timeCode();
       for (final b in bookings) {
         String type;
         if (b.wordOrBoard != null) {
           final String w = b.wordOrBoard!.toUpperCase();
-          if (["SUPER", "BOX", "A", "B", "C", "AB", "BC", "AC"].contains(w)) {
-            type = "$code-$w";
-          } else {
-            type = "$code-$w";
-          }
+          type = "$code-$w";
         } else {
           if (b.itemNumber.length == 3) {
             type = "$code-SUPER";
@@ -14086,14 +14231,34 @@ class _TicketPageState extends State<TicketPage> {
       }
     });
 
-    if (mounted) {
-      showSuccessSnack(context, AppMsg.entriesImported(bookings.length));
-    }
-
     if (autoSubmit) {
       _saveCurrentBooking(skipConfirm: true);
     }
-    return true;
+  }
+
+  Future<void> _openWhatsAppPastePreview(String clipboardText) async {
+    if (!mounted) return;
+
+    await Navigator.push<void>(
+      context,
+      appRoute(
+        _WhatsAppPastePreviewPage(
+          initialText: clipboardText.trim(),
+          accentColor: _bookingPageColor,
+          onApply: (bookings, name) {
+            if (!_ensureCanSell()) return false;
+            _addWhatsAppBookings(bookings, customerName: name);
+            return true;
+          },
+          onFinished: (addedCount, allParsed) {
+            if (!mounted) return;
+            if (addedCount > 0) {
+              showSuccessSnack(context, AppMsg.entriesImported(addedCount));
+            }
+          },
+        ),
+      ),
+    );
   }
 
   String _formatConfirmAmount(double value) {
@@ -14277,6 +14442,240 @@ class _TicketPageState extends State<TicketPage> {
       customerNameController.clear();
     });
     FocusScope.of(context).requestFocus(numberFocusNode);
+  }
+}
+
+class _WhatsAppPastePreviewPage extends StatefulWidget {
+  const _WhatsAppPastePreviewPage({
+    required this.initialText,
+    required this.accentColor,
+    required this.onApply,
+    required this.onFinished,
+  });
+
+  final String initialText;
+  final Color accentColor;
+  final bool Function(List<Booking> bookings, String? customerName) onApply;
+  final void Function(int addedCount, bool allParsed) onFinished;
+
+  @override
+  State<_WhatsAppPastePreviewPage> createState() =>
+      _WhatsAppPastePreviewPageState();
+}
+
+class _WhatsAppPastePreviewPageState extends State<_WhatsAppPastePreviewPage> {
+  late final TextEditingController _textController;
+  late final ScrollController _scrollController;
+  final FocusNode _focusNode = FocusNode();
+  bool _submitting = false;
+  String? _statusNote;
+
+  static const double _submitBarHeight = 52.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _textController = TextEditingController();
+    _scrollController = ScrollController();
+    _textController.clear();
+    _textController.text = widget.initialText;
+    _textController.addListener(_scrollTextFieldToCursor);
+  }
+
+  @override
+  void dispose() {
+    _textController.removeListener(_scrollTextFieldToCursor);
+    _focusNode.dispose();
+    _textController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  /// Scroll only the TextField when the cursor moves near the end — not the page.
+  void _scrollTextFieldToCursor() {
+    if (!_focusNode.hasFocus || !_scrollController.hasClients) return;
+    final text = _textController.text;
+    final offset = _textController.selection.baseOffset;
+    if (text.isEmpty || offset < text.length - 1) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final max = _scrollController.position.maxScrollExtent;
+      if (_scrollController.offset < max) {
+        _scrollController.animateTo(
+          max,
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  void _close() {
+    Navigator.of(context).pop();
+  }
+
+  void _submit() {
+    if (_submitting) return;
+    final text = _textController.text.trim();
+    if (text.isEmpty) {
+      setState(() => _statusNote = AppMsg.clipboardEmpty);
+      return;
+    }
+
+    setState(() {
+      _submitting = true;
+      _statusNote = null;
+    });
+
+    try {
+      final outcome = parseWhatsAppWithRemainder(text);
+      if (outcome.bookings.isEmpty) {
+        setState(() {
+          _submitting = false;
+          _statusNote = AppMsg.clipboardFormatError;
+        });
+        return;
+      }
+
+      final applied = widget.onApply(
+        outcome.bookings,
+        outcome.customerName,
+      );
+      if (!applied) {
+        setState(() => _submitting = false);
+        return;
+      }
+
+      final remaining = outcome.remainingText.trim();
+      _textController.text = remaining;
+      _textController.selection = TextSelection.collapsed(offset: 0);
+      final allParsed = remaining.isEmpty;
+
+      widget.onFinished(outcome.bookings.length, allParsed);
+
+      if (allParsed) {
+        Navigator.of(context).pop();
+        return;
+      }
+
+      setState(() {
+        _submitting = false;
+        _statusNote =
+            'Valid entries added. Unparsed lines remain — edit and submit again.';
+      });
+    } catch (_) {
+      setState(() {
+        _submitting = false;
+        _statusNote = AppMsg.clipboardFormatError;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final viewInsets = MediaQuery.viewInsetsOf(context);
+    final safePadding = MediaQuery.paddingOf(context);
+    // Keyboard open → lift submit bar only. Keyboard closed → respect home indicator.
+    final bottomLift =
+        viewInsets.bottom > 0 ? viewInsets.bottom : safePadding.bottom;
+
+    return Scaffold(
+      resizeToAvoidBottomInset: false,
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: widget.accentColor,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: _submitting ? null : _close,
+          tooltip: 'Close',
+        ),
+        title: const Text(
+          'WhatsApp Paste',
+          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 17),
+        ),
+      ),
+      body: AnimatedPadding(
+        duration: const Duration(milliseconds: 100),
+        curve: Curves.easeOut,
+        padding: EdgeInsets.only(bottom: bottomLift),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (_statusNote != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Text(
+                  _statusNote!,
+                  style: TextStyle(
+                    color: Colors.orange.shade800,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+                child: TextField(
+                  controller: _textController,
+                  focusNode: _focusNode,
+                  scrollController: _scrollController,
+                  expands: true,
+                  maxLines: null,
+                  textAlignVertical: TextAlignVertical.top,
+                  keyboardType: TextInputType.multiline,
+                  textInputAction: TextInputAction.newline,
+                  scrollPadding: const EdgeInsets.all(24),
+                  style: const TextStyle(fontSize: 14),
+                  decoration: const InputDecoration(
+                    hintText: 'Paste WhatsApp booking text here...',
+                    border: OutlineInputBorder(),
+                    alignLabelWithHint: true,
+                    contentPadding: EdgeInsets.all(12),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: SizedBox(
+                height: _submitBarHeight,
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: _submitting ? null : _submit,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: widget.accentColor,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shadowColor: Colors.transparent,
+                    surfaceTintColor: Colors.transparent,
+                    shape: const RoundedRectangleBorder(
+                      borderRadius: BorderRadius.zero,
+                    ),
+                  ),
+                  child: _submitting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Text(
+                          'SUBMIT',
+                          style: TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 

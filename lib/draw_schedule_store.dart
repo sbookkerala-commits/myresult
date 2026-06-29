@@ -351,6 +351,7 @@ class DrawScheduleStore {
 
   /// UI theme draw: last draw whose close time passed — until the next draw closes.
   /// After LSK 3 PM closes, stay LSK-colored until DEAR 6 PM close (not when DEAR 6 booking opens).
+  /// Before today's first draw closes (e.g. 3 AM), returns yesterday's last draw (DEAR 8 PM).
   static String currentUiDraw({DateTime? at, List<String>? allowed}) {
     final names = allowed ?? kDrawTimeNames;
     if (names.isEmpty) return kDrawTimeNames.first;
@@ -373,7 +374,34 @@ class DrawScheduleStore {
         lastClosed = name;
       }
     }
-    return lastClosed ?? ordered.first;
+    return lastClosed ?? ordered.last;
+  }
+
+  /// Result-page calendar date paired with [currentUiDraw].
+  /// Before today's first draw closes, uses yesterday (last night's DEAR 8 PM result).
+  static DateTime currentUiDrawResultDate({DateTime? at, List<String>? allowed}) {
+    final now = (at ?? DateTime.now()).toLocal();
+    final today = DateTime(now.year, now.month, now.day);
+    final names = allowed ?? kDrawTimeNames;
+    if (names.isEmpty) return today;
+
+    final ordered = [...names]
+      ..sort((a, b) {
+        final sa = scheduleFor(a);
+        final sb = scheduleFor(b);
+        return _minutes(sa.closeHour, sa.closeMinute)
+            .compareTo(_minutes(sb.closeHour, sb.closeMinute));
+      });
+
+    final firstCloseM = _minutes(
+      scheduleFor(ordered.first).closeHour,
+      scheduleFor(ordered.first).closeMinute,
+    );
+    final nowM = _minutes(now.hour, now.minute);
+    if (nowM < firstCloseM) {
+      return today.subtract(const Duration(days: 1));
+    }
+    return today;
   }
 
   static String scheduleWindowLabel(String drawTime) {

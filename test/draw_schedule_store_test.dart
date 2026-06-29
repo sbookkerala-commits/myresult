@@ -120,4 +120,22 @@ void main() {
       DateTime(2026, 6, 23),
     );
   });
+
+  test('currentUiDraw before first close → DEAR 8 PM', () {
+    final at = DateTime(2026, 6, 29, 3, 22);
+    expect(DrawScheduleStore.currentUiDraw(at: at), 'DEAR 8 PM');
+    expect(
+      DrawScheduleStore.currentUiDrawResultDate(at: at),
+      DateTime(2026, 6, 28),
+    );
+  });
+
+  test('currentUiDraw after DEAR 1 PM close → DEAR 1 PM today', () {
+    final at = DateTime(2026, 6, 29, 14, 0);
+    expect(DrawScheduleStore.currentUiDraw(at: at), 'DEAR 1 PM');
+    expect(
+      DrawScheduleStore.currentUiDrawResultDate(at: at),
+      DateTime(2026, 6, 29),
+    );
+  });
 }

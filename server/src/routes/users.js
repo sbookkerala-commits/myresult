@@ -5,6 +5,24 @@ const { authRequired, requireRoles } = require('../middleware/auth');
 
 const router = express.Router();
 
+/** Current logged-in user profile (all roles) — for ~1s app sync */
+router.get('/me', authRequired, async (req, res) => {
+  try {
+    const user = await User.findOne({
+      username: req.user.username,
+      deletedAt: null,
+    })
+      .select(
+        'username role isBlocked isSalesBlocked scheme rateSetId amountLimit digit1CountLimit digit2CountLimit digit3CountLimit'
+      )
+      .lean();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ user });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
 router.get('/', authRequired, requireRoles('ADMIN', 'AGENT'), async (req, res) => {
   try {
     const users = await User.find({ deletedAt: null })
