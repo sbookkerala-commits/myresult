@@ -2,6 +2,8 @@ const express = require('express');
 const Pending = require('../models/Pending');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
+const { parseLimit, parseSkip } = require('../utils/queryLimits');
+const { logError } = require('../utils/logger');
 
 const router = express.Router();
 
@@ -13,9 +15,19 @@ router.get('/', authRequired, async (req, res) => {
       createdAt: { $gte: cutoff },
       ownerUsername: req.user.username,
     };
-    const items = await Pending.find(filter).sort({ createdAt: -1 }).lean();
-    res.json({ items });
+    const limit = parseLimit(req.query.limit, 1000);
+    const skip = parseSkip(req.query.skip);
+    const items = await Pending.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+    res.json({
+      items,
+      meta: { limit, skip, truncated: items.length >= limit },
+    });
   } catch (e) {
+    logError('GET pending', e);
     res.status(500).json({ error: 'Failed to fetch pending' });
   }
 });
@@ -30,6 +42,7 @@ router.post('/', authRequired, async (req, res) => {
     });
     res.status(201).json({ id: doc._id, createdAt: doc.createdAt });
   } catch (e) {
+    logError('POST pending', e);
     res.status(500).json({ error: 'Failed to save pending' });
   }
 });
@@ -44,6 +57,7 @@ router.delete('/:id', authRequired, async (req, res) => {
     if (!updated) return res.status(404).json({ error: 'Not found' });
     res.json({ ok: true });
   } catch (e) {
+    logError('DELETE pending', e);
     res.status(500).json({ error: 'Delete failed' });
   }
 });

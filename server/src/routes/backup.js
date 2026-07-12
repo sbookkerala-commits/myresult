@@ -1,6 +1,7 @@
 const express = require('express');
 const { authRequired, requireRoles } = require('../middleware/auth');
 const { runDailyBackup } = require('../jobs/backup');
+const { logError } = require('../utils/logger');
 
 const router = express.Router();
 
@@ -10,6 +11,7 @@ router.post('/', authRequired, requireRoles('ADMIN'), async (req, res) => {
     const file = await runDailyBackup();
     res.json({ ok: true, file });
   } catch (e) {
+    logError('manual backup', e);
     res.status(500).json({ error: 'Backup failed' });
   }
 });

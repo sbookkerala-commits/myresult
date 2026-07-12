@@ -71,14 +71,16 @@ router.post('/', authRequired, async (req, res) => {
       return res.status(400).json({ error: 'key required' });
     }
 
-    // Price list / rate sets — admin only
+    // Price list / rate sets / draw times — admin only
     if (
       (key === 'priceList' ||
         key === 'priceListGameRates' ||
-        key === 'rateSets') &&
+        key === 'rateSets' ||
+        key === 'drawSchedules' ||
+        key === 'digitCountLimits') &&
       req.user.role !== 'ADMIN'
     ) {
-      return res.status(403).json({ error: 'Admin only: price list edit' });
+      return res.status(403).json({ error: 'Admin only: settings edit' });
     }
 
     const saved = await Settings.findOneAndUpdate(

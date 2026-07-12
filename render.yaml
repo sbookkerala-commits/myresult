@@ -4,20 +4,43 @@ services:
     runtime: node
     plan: free
     rootDir: server
-    buildCommand: npm install
+    buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
-      - key: USE_EMBEDDED_MONGO
-        value: false
       - key: HOST
         value: 0.0.0.0
+      - key: USE_EMBEDDED_MONGO
+        value: "false"
+      - key: SERVE_STATIC_WEB
+        value: "false"
+      - key: JSON_BODY_LIMIT
+        value: 2mb
       - key: RETENTION_DAYS
-        value: 21
+        value: "20"
       - key: JWT_EXPIRES_IN
         value: 7d
+      - key: API_LIST_LIMIT
+        value: "2000"
+      - key: RESTORE_BOOKING_LIMIT
+        value: "3000"
+      - key: RESTORE_SALE_LIMIT
+        value: "5000"
+      - key: RESTORE_CHART_LIMIT
+        value: "1000"
+      - key: BACKUP_BATCH_SIZE
+        value: "500"
+      - key: BACKUP_MAX_DOCS
+        value: "10000"
+      - key: MONGO_MAX_POOL
+        value: "5"
+      - key: MEMORY_LOG_MS
+        value: "300000"
+      - key: EXIT_ON_UNCAUGHT
+        value: "false"
+      # Paste these 2 values in Render Dashboard (do not put real secrets in git)
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET

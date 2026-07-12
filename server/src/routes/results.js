@@ -3,17 +3,23 @@ const Result = require('../models/Result');
 const ChartArchive = require('../models/ChartArchive');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff, startOfDay } = require('../utils/dates');
+const { parseLimit, parseSkip } = require('../utils/queryLimits');
+const { logError } = require('../utils/logger');
 
 const router = express.Router();
 
 router.get('/', authRequired, async (req, res) => {
   try {
     const cutoff = retentionCutoff();
+    const limit = parseLimit(req.query.limit, 2000);
+    const skip = parseSkip(req.query.skip);
     const items = await Result.find({
       deletedAt: null,
       date: { $gte: cutoff },
     })
       .sort({ date: -1 })
+      .skip(skip)
+      .limit(limit)
       .lean();
 
     res.json({
@@ -24,8 +30,10 @@ router.get('/', authRequired, async (req, res) => {
         compliments: r.compliments,
         manualOverride: !!r.manualOverride,
       })),
+      meta: { limit, skip, truncated: items.length >= limit },
     });
   } catch (e) {
+    logError('GET results', e);
     res.status(500).json({ error: 'Failed to fetch results' });
   }
 });

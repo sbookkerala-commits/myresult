@@ -7,10 +7,11 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node --max-old-space-size=384 src/index.js",
+    "start:expose-gc": "node --expose-gc --max-old-space-size=384 src/index.js",
     "dev": "node --watch src/index.js",
     "seed": "node src/seed.js",
-    "serve:web": "node src/index.js"
+    "serve:web": "node -e \"process.env.SERVE_STATIC_WEB='true';require('./src/index.js')\""
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

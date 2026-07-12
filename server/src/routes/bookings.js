@@ -2,6 +2,8 @@ const express = require('express');
 const Booking = require('../models/Booking');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
+const { parseLimit, parseSkip } = require('../utils/queryLimits');
+const { logError } = require('../utils/logger');
 
 const router = express.Router();
 
@@ -18,14 +20,20 @@ function upsertFilter(req, billNo) {
 router.get('/', authRequired, async (req, res) => {
   try {
     const cutoff = retentionCutoff();
+    const limit = parseLimit(req.query.limit);
+    const skip = parseSkip(req.query.skip);
     const filter = {
       deletedAt: null,
       createdAt: { $gte: cutoff },
       ...ownerFilter(req),
     };
-    const items = await Booking.find(filter).sort({ createdAt: -1 }).lean();
+    const items = await Booking.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
     console.log(
-      `[bookings] GET user=${req.user.username} role=${req.user.role} count=${items.length}`
+      `[bookings] GET user=${req.user.username} role=${req.user.role} count=${items.length} limit=${limit} skip=${skip}`
     );
     res.json({
       items: items.map((b) => ({
@@ -38,9 +46,10 @@ router.get('/', authRequired, async (req, res) => {
         createdAt: b.createdAt,
         clientId: b.clientId,
       })),
+      meta: { limit, skip, truncated: items.length >= limit },
     });
   } catch (e) {
-    console.error('GET bookings', e);
+    logError('GET bookings', e);
     res.status(500).json({ error: 'Failed to fetch bookings' });
   }
 });

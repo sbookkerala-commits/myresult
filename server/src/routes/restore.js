@@ -8,26 +8,38 @@ const Settings = require('../models/Settings');
 const User = require('../models/User');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
+const {
+  RESTORE_BOOKING_LIMIT,
+  RESTORE_SALE_LIMIT,
+  RESTORE_CHART_LIMIT,
+} = require('../utils/queryLimits');
+const { logInfo, logError, logMemory } = require('../utils/logger');
 
 const router = express.Router();
 
-/** Login restore — cloud → local SQLite on device */
+/** Login restore — cloud → local SQLite on device (capped to prevent OOM) */
 router.get('/restore', authRequired, async (req, res) => {
   try {
     const cutoff = retentionCutoff();
     const owner =
       req.user.role === 'ADMIN' ? {} : { ownerUsername: req.user.username };
 
+    logInfo(`[restore] start user=${req.user.username} role=${req.user.role}`);
+    logMemory('memory before restore');
+
     const [bookings, sales, results, pending, chartArchive, settingsDocs, profileUser] =
       await Promise.all([
         Booking.find({ deletedAt: null, createdAt: { $gte: cutoff }, ...owner })
           .sort({ createdAt: -1 })
+          .limit(RESTORE_BOOKING_LIMIT)
           .lean(),
         Sale.find({ deletedAt: null, createdAt: { $gte: cutoff }, ...owner })
           .sort({ createdAt: -1 })
+          .limit(RESTORE_SALE_LIMIT)
           .lean(),
         Result.find({ deletedAt: null, date: { $gte: cutoff } })
           .sort({ date: -1 })
+          .limit(2000)
           .lean(),
         Pending.find({
           deletedAt: null,
@@ -35,8 +47,9 @@ router.get('/restore', authRequired, async (req, res) => {
           ownerUsername: req.user.username,
         })
           .sort({ createdAt: -1 })
+          .limit(1000)
           .lean(),
-        ChartArchive.find().sort({ date: -1 }).limit(5000).lean(),
+        ChartArchive.find().sort({ date: -1 }).limit(RESTORE_CHART_LIMIT).lean(),
         Settings.find().lean(),
         User.findOne({ username: req.user.username, deletedAt: null })
           .select(
@@ -48,9 +61,10 @@ router.get('/restore', authRequired, async (req, res) => {
     const settings = {};
     for (const d of settingsDocs) settings[d.key] = d.value;
 
-    console.log(
-      `[restore] user=${req.user.username} role=${req.user.role} bookings=${bookings.length}`
+    logInfo(
+      `[restore] user=${req.user.username} role=${req.user.role} bookings=${bookings.length} sales=${sales.length} chart=${chartArchive.length}`
     );
+    logMemory('memory after restore query');
 
     res.json({
       bookings: bookings.map((b) => ({
@@ -105,9 +119,21 @@ router.get('/restore', authRequired, async (req, res) => {
             digit3CountLimit: profileUser.digit3CountLimit,
           }
         : null,
+      meta: {
+        limits: {
+          bookings: RESTORE_BOOKING_LIMIT,
+          sales: RESTORE_SALE_LIMIT,
+          chartArchive: RESTORE_CHART_LIMIT,
+        },
+        truncated: {
+          bookings: bookings.length >= RESTORE_BOOKING_LIMIT,
+          sales: sales.length >= RESTORE_SALE_LIMIT,
+          chartArchive: chartArchive.length >= RESTORE_CHART_LIMIT,
+        },
+      },
     });
   } catch (e) {
-    console.error('restore', e);
+    logError('restore', e);
     res.status(500).json({ error: 'Restore failed' });
   }
 });

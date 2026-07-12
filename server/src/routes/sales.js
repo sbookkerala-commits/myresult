@@ -2,6 +2,8 @@ const express = require('express');
 const Sale = require('../models/Sale');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
+const { parseLimit, parseSkip } = require('../utils/queryLimits');
+const { logError } = require('../utils/logger');
 
 const router = express.Router();
 
@@ -13,12 +15,16 @@ function ownerFilter(req) {
 router.get('/', authRequired, async (req, res) => {
   try {
     const cutoff = retentionCutoff();
+    const limit = parseLimit(req.query.limit);
+    const skip = parseSkip(req.query.skip);
     const items = await Sale.find({
       deletedAt: null,
       createdAt: { $gte: cutoff },
       ...ownerFilter(req),
     })
       .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
       .lean();
 
     res.json({
@@ -33,8 +39,10 @@ router.get('/', authRequired, async (req, res) => {
         createdAt: s.createdAt,
         clientId: s.clientId,
       })),
+      meta: { limit, skip, truncated: items.length >= limit },
     });
   } catch (e) {
+    logError('GET sales', e);
     res.status(500).json({ error: 'Failed to fetch sales' });
   }
 });

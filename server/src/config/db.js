@@ -1,18 +1,57 @@
 const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
+const { logInfo, logWarn, logError, logMemory } = require('../utils/logger');
 
 let memoryServer = null;
+let listenersAttached = false;
 
 const embeddedDataDir = path.join(__dirname, '../../.mongo-data');
 
+function attachConnectionListeners() {
+  if (listenersAttached) return;
+  listenersAttached = true;
+
+  mongoose.connection.on('connected', () => {
+    logInfo('MongoDB connected', {
+      readyState: mongoose.connection.readyState,
+      host: mongoose.connection.host,
+      name: mongoose.connection.name,
+    });
+    logMemory('memory after MongoDB connect');
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    logWarn('MongoDB disconnected — mongoose will attempt auto-reconnect');
+  });
+
+  mongoose.connection.on('reconnected', () => {
+    logInfo('MongoDB reconnected');
+  });
+
+  mongoose.connection.on('error', (err) => {
+    logError('MongoDB connection error', err);
+  });
+}
+
 async function connectDb() {
   mongoose.set('strictQuery', true);
+  attachConnectionListeners();
 
   const uri = process.env.MONGODB_URI;
   const useEmbedded =
     process.env.USE_EMBEDDED_MONGO === 'true' ||
     process.env.USE_EMBEDDED_MONGO === '1';
+
+  const connectOptions = {
+    maxPoolSize: parseInt(process.env.MONGO_MAX_POOL || '5', 10),
+    minPoolSize: 0,
+    serverSelectionTimeoutMS: 15000,
+    socketTimeoutMS: 45000,
+    heartbeatFrequencyMS: 10000,
+    // Keep memory low on Render free/starter
+    maxIdleTimeMS: 30000,
+  };
 
   if (useEmbedded) {
     if (process.env.NODE_ENV === 'production') {
@@ -27,9 +66,10 @@ async function connectDb() {
       },
     });
     const embeddedUri = memoryServer.getUri();
-    await mongoose.connect(embeddedUri);
-    console.log('Using embedded MongoDB (local dev only)');
-    console.log('Data folder:', embeddedDataDir);
+    await mongoose.connect(embeddedUri, connectOptions);
+    logInfo('Using embedded MongoDB (local dev only)', {
+      dataFolder: embeddedDataDir,
+    });
     return;
   }
 
@@ -39,16 +79,29 @@ async function connectDb() {
     );
   }
 
-  await mongoose.connect(uri);
-  console.log('MongoDB Atlas connected');
+  await mongoose.connect(uri, connectOptions);
+  logInfo('MongoDB Atlas connected');
 }
 
 async function disconnectDb() {
-  await mongoose.disconnect();
+  try {
+    await mongoose.disconnect();
+    logInfo('MongoDB disconnected cleanly');
+  } catch (err) {
+    logError('MongoDB disconnect failed', err);
+  }
   if (memoryServer) {
-    await memoryServer.stop();
+    try {
+      await memoryServer.stop();
+    } catch (err) {
+      logError('Embedded MongoDB stop failed', err);
+    }
     memoryServer = null;
   }
 }
 
-module.exports = { connectDb, disconnectDb };
+function isDbReady() {
+  return mongoose.connection.readyState === 1;
+}
+
+module.exports = { connectDb, disconnectDb, isDbReady };
