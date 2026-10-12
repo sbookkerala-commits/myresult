@@ -17,6 +17,8 @@ async function configureCredential(account, actor) {
       typeof account.private_key !== 'string' || !account.private_key.includes('BEGIN PRIVATE KEY')) {
     throw Object.assign(new Error('Invalid My Result notification credentials'), { status: 400 });
   }
+  try { crypto.createPrivateKey(account.private_key); }
+  catch (_) { throw Object.assign(new Error('Invalid notification private key'), { status: 400 }); }
   // Keep the private key out of app settings, restore payloads, logs and the APK.
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv);
