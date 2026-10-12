@@ -102,3 +102,20 @@ test('API uses authenticated user, reports usage and returns a limit error', asy
   assert.equal(response.status, 409);
   assert.equal((await response.json()).code, 'DAILY_AMOUNT_LIMIT');
 });
+
+test('legacy profiles without a limit field return unlimited', async () => {
+  await User.collection.updateOne({ username: 'agent' }, { $unset: { amountLimit: '' } });
+  const response = await request('/api/bookings/daily-limit', null, 'GET', 'AGENT');
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).limit, 0);
+});
+
+test('unlimited and administrator accounts retain unrestricted bookings', async () => {
+  await User.updateOne({ username: 'agent' }, { amountLimit: 0 });
+  await save(1, 1000);
+  await User.create({ username: 'admin', passwordHash: 'unused', role: 'ADMIN', amountLimit: 1 });
+  const candidate = { ...doc(2, 5000), username: 'admin', ownerUsername: 'admin' };
+  await saveBooking(candidate, { billNo: 2, ownerUsername: 'admin' });
+  assert.equal(await usedPaise('agent', new Date()), 100000);
+  assert.equal(await usedPaise('admin', new Date()), 500000);
+});

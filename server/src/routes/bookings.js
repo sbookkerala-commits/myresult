@@ -14,7 +14,7 @@ router.get('/daily-limit', authRequired, async (req, res) => {
     const user = await User.findOne({ username: req.user.username, deletedAt: null }).lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
     const used = await usedPaise(user.username, new Date());
-    res.json({ enforced: true, limit: user.amountLimit, used: used / 100 });
+    res.json({ enforced: true, limit: Number(user.amountLimit) || 0, used: used / 100 });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load daily limit' });
   }
