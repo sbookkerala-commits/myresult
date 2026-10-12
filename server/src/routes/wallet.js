@@ -7,7 +7,7 @@ const Payment = require('../models/WalletPayment');
 const Device = require('../models/NotificationDevice');
 const { authRequired } = require('../middleware/auth');
 const { error, money, snapshot, adminCredit, reviewPayment } = require('../services/wallet');
-const { deliverPendingNotifications, configureCredential, credentialConfigured } = require('../services/paymentNotifications');
+const { deliverPendingNotifications, configureCredential, credentialConfigured, messaging } = require('../services/paymentNotifications');
 const router = express.Router();
 router.use(authRequired, async (req, res, next) => {
   try {
@@ -125,6 +125,20 @@ router.post('/device', route(async (req, res) => {
 router.post('/device/remove', route(async (req, res) => {
   await Device.deleteOne({ token: req.body.token, username: req.user.username });
   res.json({ ok: true });
+}));
+router.post('/device/test', route(async (req, res) => {
+  adminOnly(req);
+  const device = await Device.findOne({ username: req.user.username,
+    ...(req.body.token ? { token: req.body.token } : {}) }).select('+token').sort({ updatedAt: -1 });
+  if (!device) throw error('Open the admin app and allow notifications first', 409);
+  const sender = await messaging();
+  if (!sender) throw error('Server notifications have not been configured', 503);
+  await sender.send({ token: device.token,
+    notification: { title: 'My Result', body: 'Notification test successful.' },
+    data: { type: 'wallet_test' }, android: { priority: 'high', notification: {
+      channelId: 'wallet_payments', tag: 'wallet-notification-test', icon: 'ic_notification', sound: 'default',
+    } } });
+  res.json({ accepted: true });
 }));
 router.use((e, req, res, next) => {
   if (res.headersSent) return next(e);
