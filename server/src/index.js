@@ -34,6 +34,8 @@ const chartRoutes = require('./routes/chartArchive');
 const settingsRoutes = require('./routes/settings');
 const restoreRoutes = require('./routes/restore');
 const backupRoutes = require('./routes/backup');
+const walletRoutes = require('./routes/wallet');
+const { deliverPendingNotifications } = require('./services/paymentNotifications');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -86,7 +88,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'myresult-api',
-    features: { dailyAmountLimit: 1 },
+    features: { dailyAmountLimit: 1, wallet: 1 },
     environment: process.env.NODE_ENV || 'development',
     time: new Date().toISOString(),
     retentionDays: parseInt(process.env.RETENTION_DAYS || '20', 10),
@@ -107,6 +109,7 @@ app.use('/api/chart-archive', chartRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/sync', restoreRoutes);
 app.use('/api/backup', backupRoutes);
+app.use('/api/wallet', walletRoutes);
 
 // Static Flutter web is OPTIONAL — serving ~37MB CanvasKit assets on a
 // 512MB Render instance is a common cause of exit status 134 (SIGABRT/OOM).
@@ -179,6 +182,9 @@ async function start() {
 
   await connectDb();
   await ensureAdminUser();
+  const notificationTimer = setInterval(() => { void deliverPendingNotifications(); }, 30000);
+  notificationTimer.unref();
+  void deliverPendingNotifications();
 
   try {
     await runRetentionJob();

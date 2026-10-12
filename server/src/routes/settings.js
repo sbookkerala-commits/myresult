@@ -72,6 +72,9 @@ router.post('/', authRequired, async (req, res) => {
     if (!key) {
       return res.status(400).json({ error: 'key required' });
     }
+    if (key === 'walletPayment') {
+      return res.status(403).json({ error: 'Use the admin wallet payment settings endpoint' });
+    }
 
     // Price list / rate sets / draw times — admin only
     if (

@@ -12,6 +12,9 @@ const bookingSchema = new mongoose.Schema(
     createdAt: { type: Date, required: true, index: true },
     deletedAt: { type: Date, default: null },
     clientId: { type: String, default: null },
+    walletTracked: { type: Boolean, default: false },
+    walletBasePaise: { type: Number, default: 0 },
+    walletDebitPaise: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

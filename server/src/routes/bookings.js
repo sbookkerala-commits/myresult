@@ -6,6 +6,9 @@ const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
 const { parseLimit, parseSkip } = require('../utils/queryLimits');
 const { logError } = require('../utils/logger');
+const mongoose = require('mongoose');
+const WalletAccount = require('../models/WalletAccount');
+const { lockUser, applyBooking, snapshot } = require('../services/wallet');
 
 const router = express.Router();
 
@@ -14,7 +17,8 @@ router.get('/daily-limit', authRequired, async (req, res) => {
     const user = await User.findOne({ username: req.user.username, deletedAt: null }).lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
     const used = await usedPaise(user.username, new Date());
-    res.json({ enforced: true, limit: Number(user.amountLimit) || 0, used: used / 100 });
+    const wallet = await WalletAccount.findOne({ username: user.username }).lean();
+    res.json({ enforced: true, limit: Number(user.amountLimit) || 0, used: used / 100, wallet: snapshot(wallet) });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load daily limit' });
   }
@@ -124,12 +128,19 @@ router.post('/', authRequired, async (req, res) => {
 router.delete('/:billNo', authRequired, async (req, res) => {
   try {
     const billNo = parseInt(req.params.billNo, 10);
-    const filter = { billNo, deletedAt: null, ...ownerFilter(req) };
-    const updated = await Booking.findOneAndUpdate(
-      filter,
-      { $set: { deletedAt: new Date() } },
-      { new: true }
-    );
+    const filter = { billNo, ...ownerFilter(req) };
+    const updated = await mongoose.connection.transaction(async session => {
+      const existing = await Booking.findOne(filter).session(session);
+      if (!existing) return null;
+      const user = await lockUser(existing.username, session);
+      if (existing.deletedAt) return existing;
+      const doc = { ...existing.toObject(), deletedAt: new Date() };
+      await applyBooking(doc, existing, user, 0, session);
+      return Booking.findOneAndUpdate(filter, { $set: {
+        deletedAt: doc.deletedAt, walletTracked: doc.walletTracked,
+        walletBasePaise: doc.walletBasePaise, walletDebitPaise: doc.walletDebitPaise,
+      } }, { new: true, session });
+    });
     if (!updated) return res.status(404).json({ error: 'Booking not found' });
     res.json({ ok: true, billNo });
   } catch (e) {

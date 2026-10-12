@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Booking = require('../models/Booking');
+const { applyBooking } = require('./wallet');
 
 const paise = (amount) => Math.round(Number(amount) * 100);
 
@@ -45,6 +46,11 @@ async function saveBooking(doc, filter) {
       error.status = 404;
       throw error;
     }
+    if (user.role !== 'ADMIN' && (user.isBlocked || user.isSalesBlocked)) {
+      const error = new Error('Booking is blocked for this user');
+      error.status = 403;
+      throw error;
+    }
     const existing = await Booking.findOne(filter).session(session);
     if (existing) {
       // An edit cannot move a bill into a different date or user's budget.
@@ -64,6 +70,7 @@ async function saveBooking(doc, filter) {
         throw error;
       }
     }
+    await applyBooking(doc, existing, user, amount, session);
     return Booking.findOneAndUpdate(filter, { $set: doc }, { upsert: true, new: true, session });
   });
 }
