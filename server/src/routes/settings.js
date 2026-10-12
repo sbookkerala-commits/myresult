@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const { authRequired, requireRoles } = require('../middleware/auth');
 
 const router = express.Router();
+const { amountLimit: readAmountLimit } = require('../utils/userLimits');
 
 router.get('/', authRequired, async (req, res) => {
   try {
@@ -28,11 +29,12 @@ router.post('/', authRequired, async (req, res) => {
       if (req.user.role !== 'ADMIN') {
         return res.status(403).json({ error: 'Admin only' });
       }
+      users.forEach((user) => readAmountLimit(user.amountLimit));
       for (const u of users) {
         const username = (u.username || '').trim().toLowerCase();
         if (!username) continue;
         const role = (u.role || 'AGENT').toUpperCase();
-        const isAgentRole = role === 'AGENT' || role === 'SUBAGENT';
+        const isAgentRole = role !== 'ADMIN';
         const existing = await User.findOne({ username });
         const passwordHash = u.password
           ? await bcrypt.hash(u.password, 10)
@@ -42,7 +44,7 @@ router.post('/', authRequired, async (req, res) => {
           ? {
               scheme: (u.scheme || 'ALL').toString(),
               rateSetId: (u.rateSetId || 'standard').toString(),
-              amountLimit: Number(u.amountLimit) || 0,
+              amountLimit: readAmountLimit(u.amountLimit),
               digit1CountLimit: parseInt(u.digit1CountLimit, 10) || 0,
               digit2CountLimit: parseInt(u.digit2CountLimit, 10) || 0,
               digit3CountLimit: parseInt(u.digit3CountLimit, 10) || 0,
@@ -92,7 +94,7 @@ router.post('/', authRequired, async (req, res) => {
     res.json({ key: saved.key, value: saved.value });
   } catch (e) {
     console.error('settings', e);
-    res.status(500).json({ error: 'Failed to save settings' });
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Failed to save settings' });
   }
 });
 

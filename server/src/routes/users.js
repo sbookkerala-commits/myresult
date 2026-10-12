@@ -4,6 +4,7 @@ const User = require('../models/User');
 const { authRequired, requireRoles } = require('../middleware/auth');
 
 const router = express.Router();
+const { amountLimit: readAmountLimit } = require('../utils/userLimits');
 
 /** Current logged-in user profile (all roles) — for ~1s app sync */
 router.get('/me', authRequired, async (req, res) => {
@@ -39,7 +40,7 @@ router.get('/', authRequired, requireRoles('ADMIN', 'AGENT'), async (req, res) =
 function readAgentFields(body) {
   const scheme = (body.scheme || 'ALL').toString().trim() || 'ALL';
   const rateSetId = (body.rateSetId || 'standard').toString().trim() || 'standard';
-  const amountLimit = Number(body.amountLimit) || 0;
+  const amountLimit = readAmountLimit(body.amountLimit);
   const digit1CountLimit = parseInt(body.digit1CountLimit, 10) || 0;
   const digit2CountLimit = parseInt(body.digit2CountLimit, 10) || 0;
   const digit3CountLimit = parseInt(body.digit3CountLimit, 10) || 0;
@@ -77,7 +78,7 @@ router.post('/', authRequired, requireRoles('ADMIN', 'AGENT'), async (req, res) 
     if (exists) return res.status(409).json({ error: 'Username exists' });
 
     const passwordHash = await bcrypt.hash(pw, 10);
-    const isAgentRole = r === 'AGENT' || r === 'SUBAGENT';
+    const isAgentRole = r !== 'ADMIN';
     const user = await User.create({
       username: u,
       passwordHash,
@@ -101,7 +102,7 @@ router.post('/', authRequired, requireRoles('ADMIN', 'AGENT'), async (req, res) 
       digit3CountLimit: user.digit3CountLimit,
     });
   } catch (e) {
-    res.status(500).json({ error: 'Failed to create user' });
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Failed to create user' });
   }
 });
 
@@ -138,7 +139,7 @@ router.patch('/:username', authRequired, requireRoles('ADMIN'), async (req, res)
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   } catch (e) {
-    res.status(500).json({ error: 'Update failed' });
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Update failed' });
   }
 });
 

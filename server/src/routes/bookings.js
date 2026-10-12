@@ -1,11 +1,24 @@
 const express = require('express');
 const Booking = require('../models/Booking');
+const User = require('../models/User');
+const { usedPaise, saveBooking } = require('../services/dailyBookingLimit');
 const { authRequired } = require('../middleware/auth');
 const { retentionCutoff } = require('../utils/dates');
 const { parseLimit, parseSkip } = require('../utils/queryLimits');
 const { logError } = require('../utils/logger');
 
 const router = express.Router();
+
+router.get('/daily-limit', authRequired, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.user.username, deletedAt: null }).lean();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const used = await usedPaise(user.username, new Date());
+    res.json({ enforced: true, limit: user.amountLimit, used: used / 100 });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load daily limit' });
+  }
+});
 
 function ownerFilter(req) {
   if (req.user.role === 'ADMIN') return {};
@@ -59,7 +72,7 @@ router.post('/', authRequired, async (req, res) => {
     const body = req.body || {};
     const billNo = parseInt(body.billNo, 10);
     const createdAt = body.createdAt ? new Date(body.createdAt) : new Date();
-    if (!billNo || !Array.isArray(body.rows)) {
+    if (!billNo || !Array.isArray(body.rows) || !Number.isFinite(createdAt.getTime())) {
       return res.status(400).json({ error: 'billNo and rows required' });
     }
 
@@ -69,7 +82,9 @@ router.post('/', authRequired, async (req, res) => {
 
     const doc = {
       billNo,
-      username: body.username || req.user.username,
+      username: req.user.role === 'ADMIN'
+        ? (body.username || req.user.username).trim().toLowerCase()
+        : req.user.username,
       ownerUsername: req.user.username,
       rows: body.rows,
       drawName: body.drawName || '',
@@ -80,11 +95,9 @@ router.post('/', authRequired, async (req, res) => {
       deletedAt: body.deleted ? new Date() : null,
     };
 
-    const saved = await Booking.findOneAndUpdate(
-      upsertFilter(req, billNo),
-      { $set: doc },
-      { upsert: true, new: true }
-    );
+    const existing = await Booking.findOne(upsertFilter(req, billNo)).select('username').lean();
+    if (existing) doc.username = existing.username;
+    const saved = await saveBooking(doc, upsertFilter(req, billNo));
 
     console.log(
       `[bookings] POST user=${req.user.username} role=${req.user.role} billNo=${saved.billNo}`
@@ -101,6 +114,7 @@ router.post('/', authRequired, async (req, res) => {
       clientId: saved.clientId,
     });
   } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code });
     console.error('POST booking', e);
     res.status(500).json({ error: 'Failed to save booking' });
   }

@@ -58,12 +58,12 @@ async function connectDb() {
       throw new Error('USE_EMBEDDED_MONGO must not be enabled in production');
     }
     fs.mkdirSync(embeddedDataDir, { recursive: true });
-    const { MongoMemoryServer } = require('mongodb-memory-server');
-    memoryServer = await MongoMemoryServer.create({
-      instance: {
+    const { MongoMemoryReplSet } = require('mongodb-memory-server');
+    memoryServer = await MongoMemoryReplSet.create({
+      replSet: { count: 1, storageEngine: 'wiredTiger' },
+      instanceOpts: [{
         dbPath: embeddedDataDir,
-        storageEngine: 'wiredTiger',
-      },
+      }],
     });
     const embeddedUri = memoryServer.getUri();
     await mongoose.connect(embeddedUri, connectOptions);

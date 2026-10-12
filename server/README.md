@@ -35,6 +35,17 @@ npm run dev
 - **Daily backup:** 2:00 AM cron → `server/backups/`
 - **Passwords:** bcrypt hashed
 - **Roles:** ADMIN, AGENT, SUBAGENT, CUSTOMER
+- **Daily amount limit:** Admin sets `amountLimit` per user (0 means unlimited).
+  All draws and boards share one Indian calendar-day allowance, resetting at
+  midnight IST. Deleted bills release their allowance; edits replace their old
+  amount. Limited accounts must confirm bookings online. MongoDB transactions
+  serialize bookings per user so simultaneous devices cannot exceed the limit.
+  Atlas or a replica set is required (embedded development MongoDB also uses a
+  single-node replica set). `GET /api/bookings/daily-limit` reports live usage;
+  exceeding the limit returns HTTP 409 with code `DAILY_AMOUNT_LIMIT`.
+
+Run daily-limit API integration tests with `node --test test/dailyBookingLimit.test.js`
+from `server/`; these use an isolated temporary MongoDB replica set.
 
 ## Flutter
 
