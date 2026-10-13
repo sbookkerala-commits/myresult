@@ -8,6 +8,7 @@ const WalletAccount = require('../models/WalletAccount');
 const WalletEntry = require('../models/WalletEntry');
 const WalletPayment = require('../models/WalletPayment');
 const WalletWinning = require('../models/WalletWinning');
+const WalletWithdrawal = require('../models/WalletWithdrawal');
 const BackupSnapshot = require('../models/BackupSnapshot');
 const { retentionCutoff } = require('../utils/dates');
 const {
@@ -48,7 +49,7 @@ async function runDailyBackup() {
   logMemory('memory before backup');
 
   try {
-    const [bookings, sales, results, chartArchive, settings, users, walletAccounts, walletEntries, walletPayments, walletWinnings] =
+    const [bookings, sales, results, chartArchive, settings, users, walletAccounts, walletEntries, walletPayments, walletWinnings, walletWithdrawals] =
       await Promise.all([
         loadInBatches(
           Booking,
@@ -74,6 +75,7 @@ async function runDailyBackup() {
         loadInBatches(WalletEntry, {}, { limit: 5000 }),
         loadInBatches(WalletPayment, {}, { limit: 5000 }),
         loadInBatches(WalletWinning, {}, { limit: 5000 }),
+        loadInBatches(WalletWithdrawal, {}, { limit: 5000 }),
       ]);
 
     const counts = {
@@ -87,6 +89,7 @@ async function runDailyBackup() {
       walletEntries: walletEntries.length,
       walletPayments: walletPayments.length,
       walletWinnings: walletWinnings.length,
+      walletWithdrawals: walletWithdrawals.length,
     };
     logInfo('[backup] Loaded collections', counts);
 
@@ -111,6 +114,7 @@ async function runDailyBackup() {
       walletEntries,
       walletPayments,
       walletWinnings,
+      walletWithdrawals,
     };
 
     const approxBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');

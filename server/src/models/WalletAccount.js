@@ -6,5 +6,7 @@ const schema = new mongoose.Schema({
   totalCreditPaise: { type: Number, default: 0, min: 0 },
   winningsPaise: { type: Number, default: 0, min: 0 },
   bookedPaise: { type: Number, default: 0, min: 0 },
+  withdrawalReservedPaise: { type: Number, default: 0, min: 0 },
+  withdrawnPaise: { type: Number, default: 0, min: 0 },
 }, { timestamps: true });
 module.exports = mongoose.model('WalletAccount', schema);

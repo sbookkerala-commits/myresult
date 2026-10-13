@@ -5,9 +5,11 @@ const Account = require('../models/WalletAccount');
 const Entry = require('../models/WalletEntry');
 const Payment = require('../models/WalletPayment');
 const Device = require('../models/NotificationDevice');
+const Withdrawal = require('../models/WalletWithdrawal');
 const { authRequired } = require('../middleware/auth');
 const { error, money, snapshot, adminCredit, reviewPayment } = require('../services/wallet');
 const { verifiedWhatsAppPayment, receiptFingerprint } = require('../services/manualWalletPayment');
+const { summary: withdrawalSummary, requestWithdrawal, reviewWithdrawal } = require('../services/walletWithdrawals');
 const { deliverPendingNotifications, configureCredential, credentialConfigured, messaging } = require('../services/paymentNotifications');
 const router = express.Router();
 router.use(authRequired, async (req, res, next) => {
@@ -54,21 +56,43 @@ router.post('/settings', route(async (req, res) => {
 }));
 router.get('/', route(async (req, res) => {
   const name = username(req);
-  const [account, entries, payments] = await Promise.all([
+  const [account, entries, payments, withdrawals] = await Promise.all([
     Account.findOne({ username: name }).lean(), Entry.find({ username: name }).sort({ createdAt: -1 }).limit(50).lean(),
     Payment.find({ username: name }).sort({ createdAt: -1 }).limit(50).lean(),
+    Withdrawal.find({ username: name }).sort({ createdAt: -1 }).limit(50).lean(),
   ]);
-  res.json({ ...snapshot(account), entries, payments });
+  res.json({ ...snapshot(account), ...withdrawalSummary(account), entries, payments, withdrawals });
 }));
 router.get('/admin', route(async (req, res) => {
   adminOnly(req);
-  const [users, accounts, payments, pendingCount] = await Promise.all([
+  const [users, accounts, payments, pendingCount, withdrawals, pendingWithdrawalCount] = await Promise.all([
     User.find({ role: { $ne: 'ADMIN' }, deletedAt: null }).select('username role').sort({ username: 1 }).lean(),
     Account.find().lean(), Payment.find({ status: 'pending' }).sort({ createdAt: 1 }).limit(100).lean(),
     Payment.countDocuments({ status: 'pending' }),
+    Withdrawal.find({ status: { $in: ['pending', 'approved'] } }).sort({ createdAt: 1 }).limit(100).lean(),
+    Withdrawal.countDocuments({ status: { $in: ['pending', 'approved'] } }),
   ]);
-  res.json({ users: users.map(u => ({ ...u, ...snapshot(accounts.find(a => a.username === u.username)) })),
-    payments, pendingCount, pushConfigured: await credentialConfigured() });
+  res.json({ users: users.map(u => ({ ...u, ...snapshot(accounts.find(a => a.username === u.username)),
+    ...withdrawalSummary(accounts.find(a => a.username === u.username)) })),
+    payments, pendingCount, withdrawals, pendingWithdrawalCount, pushConfigured: await credentialConfigured() });
+}));
+router.post('/withdrawals', route(async (req, res) => {
+  const withdrawal = await requestWithdrawal(req.walletUser.username, req.body, key(req.body.requestId));
+  void deliverPendingNotifications();
+  res.status(201).json({ withdrawal });
+}));
+router.get('/withdrawals/:id', route(async (req, res) => {
+  if (!require('mongoose').isValidObjectId(req.params.id)) throw error('Invalid withdrawal');
+  const withdrawal = await Withdrawal.findById(req.params.id).lean();
+  if (!withdrawal || (req.walletUser.role !== 'ADMIN' && withdrawal.username !== req.walletUser.username)) throw error('Withdrawal not found', 404);
+  res.json({ withdrawal });
+}));
+router.post('/withdrawals/:id/cancel', route(async (req, res) => {
+  res.json({ withdrawal: await reviewWithdrawal(req.params.id, req.walletUser.username, { action: 'cancelled' }, { customer: true }) });
+}));
+router.post('/withdrawals/:id/review', route(async (req, res) => {
+  adminOnly(req);
+  res.json({ withdrawal: await reviewWithdrawal(req.params.id, req.walletUser.username, req.body) });
 }));
 router.post('/notification-credentials', route(async (req, res) => {
   adminOnly(req);
