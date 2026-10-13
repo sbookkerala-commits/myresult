@@ -1,7 +1,9 @@
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const Booking = require('../models/Booking');
-const { applyBooking } = require('./wallet');
+const WalletAccount = require('../models/WalletAccount');
+const { applyBooking, snapshot } = require('./wallet');
+const { summary: withdrawalSummary } = require('./walletWithdrawals');
 
 const paise = (amount) => Math.round(Number(amount) * 100);
 
@@ -71,7 +73,13 @@ async function saveBooking(doc, filter, actorUsername = doc.ownerUsername) {
       }
     }
     await applyBooking(doc, existing, user, amount, session, actorUsername);
-    return Booking.findOneAndUpdate(filter, { $set: doc }, { upsert: true, new: true, session });
+    const saved = await Booking.findOneAndUpdate(filter, { $set: doc }, { upsert: true, new: true, session });
+    const account = await WalletAccount.findOne({ username: user.username }).session(session);
+    // Return the balance from the same committed booking transaction. Metadata
+    // stays off the booking document and avoids a second client round trip.
+    saved.$locals.walletSnapshot = { ...snapshot(account), ...withdrawalSummary(account) };
+    saved.$locals.amountLimit = user.amountLimit;
+    return saved;
   });
 }
 

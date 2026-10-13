@@ -71,6 +71,41 @@ test('concurrent phones cannot spend the same wallet balance', async () => {
   assert.equal((await Account.findOne()).balancePaise, 2000);
   assert.equal(await Booking.countDocuments(), 1);
 });
+
+test('booking POST returns committed wallet balance without a follow-up request', async () => {
+  await adminCredit('agent', 200, 'admin', 'request_12345');
+  await User.updateOne({ username: 'agent' }, { amountLimit: 150 });
+  const payload = bill(501, 50);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await request('/api/bookings', payload, 'agent');
+    assert.equal(response.status, 201);
+    const saved = await response.json();
+    assert.equal(saved.wallet.balance, 150);
+    assert.equal(saved.wallet.booked, 50);
+    assert.equal(saved.wallet.totalCredit, 200);
+    assert.equal(saved.wallet.withdrawable, 150);
+    assert.equal(saved.amountLimit, 150);
+  }
+  assert.equal(await Booking.countDocuments(), 1);
+  assert.equal(await Entry.countDocuments({ kind: 'booking' }), 1);
+  const stored = await Booking.findOne({ billNo: 501 }).lean();
+  assert.equal('walletSnapshot' in stored, false);
+  assert.equal('$locals' in stored, false);
+});
+
+test('single booking POST still rejects daily-limit and wallet overspending', async () => {
+  await adminCredit('agent', 200, 'admin', 'request_12345');
+  await User.updateOne({ username: 'agent' }, { amountLimit: 100 });
+  let response = await request('/api/bookings', bill(502, 101), 'agent');
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, 'DAILY_AMOUNT_LIMIT');
+  await User.updateOne({ username: 'agent' }, { amountLimit: 0 });
+  response = await request('/api/bookings', bill(502, 201), 'agent');
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, 'WALLET_BALANCE');
+  assert.equal(await Booking.countDocuments(), 0);
+  assert.equal((await Account.findOne({ username: 'agent' })).balancePaise, 20000);
+});
 test('edits debit differences, deletion refunds only once', async () => {
   await adminCredit('agent', 200, 'admin', 'request_12345');
   await save(1, 100); await save(1, 150); await save(1, 80);

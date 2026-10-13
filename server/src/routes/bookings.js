@@ -122,6 +122,8 @@ router.post('/', authRequired, async (req, res) => {
       businessDate: saved.businessDate || null,
       createdAt: saved.createdAt,
       clientId: saved.clientId,
+      wallet: saved.$locals.walletSnapshot,
+      amountLimit: saved.$locals.amountLimit,
     });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ error: e.message, code: e.code });
