@@ -3,6 +3,10 @@ const User = require('../models/User');
 const WalletAccount = require('../models/WalletAccount');
 const WalletEntry = require('../models/WalletEntry');
 const WalletPayment = require('../models/WalletPayment');
+const Settings = require('../models/Settings');
+const Result = require('../models/Result');
+const Winning = require('../models/WalletWinning');
+const { rowType, billDate, drawCutoff, saleAmount } = require('./winningRules');
 
 function error(message, status = 400, code) {
   return Object.assign(new Error(message), { status, code });
@@ -27,6 +31,7 @@ function snapshot(account) {
     enabled: !!account?.enabled,
     balance: (account?.balancePaise || 0) / 100,
     totalCredit: (account?.totalCreditPaise || 0) / 100,
+    winnings: (account?.winningsPaise || 0) / 100,
     booked: (account?.bookedPaise || 0) / 100,
   };
 }
@@ -79,15 +84,49 @@ async function reviewPayment(id, actor, action, note) {
     return payment;
   });
 }
-async function applyBooking(doc, existing, user, amountPaise, session) {
+async function applyBooking(doc, existing, user, amountPaise, session, actorUsername = doc.ownerUsername) {
   const account = await WalletAccount.findOne({ username: user.username }).session(session);
-  if (!account?.enabled || user.role === 'ADMIN') return;
+  if (user.role === 'ADMIN') return;
+  const settings = Object.fromEntries((await Settings.find({ key: { $in: ['priceList', 'priceListGameRates', 'rateSets', 'drawSchedules'] } })
+    .session(session).lean()).map(s => [s.key, s.value]));
+  const owner = actorUsername === user.username ? user : await User.findOne({ username: actorUsername, deletedAt: null }).session(session);
+  const unchanged = existing && JSON.stringify(existing.rows) === JSON.stringify(doc.rows) &&
+    billDate(existing) === billDate(doc) && !!existing.deletedAt === !!doc.deletedAt;
+  const now = new Date();
+  const draws = [...new Set(doc.rows.map(rowType).filter(Boolean).map(t => t.draw))];
+  if (owner?.role !== 'ADMIN' && !unchanged) {
+    for (const draw of new Set([...draws, ...(existing?.rows || []).map(rowType).filter(Boolean).map(t => t.draw)])) {
+      const day = billDate(existing || doc);
+      const known = await Result.exists({ drawCode: draw, date: new Date(`${day}T00:00:00Z`), walletAuthorizedAt: { $ne: null }, deletedAt: null }).session(session);
+      if (now >= drawCutoff(draw, day, settings.drawSchedules) || known) {
+        throw error('This draw is closed. Select the next draw date.', 409, 'DRAW_CLOSED');
+      }
+    }
+  }
+  if (!doc.deletedAt && !unchanged) {
+    for (const row of doc.rows) {
+      if (!rowType(row)) continue;
+      const count = Number(row.count);
+      if (!Number.isSafeInteger(count) || count <= 0 || Math.abs(Math.round(Number(row.amount) * 100) - saleAmount(row, user, settings)) > 1) {
+        throw error('Booking count or amount does not match this user\'s rate. Refresh and try again.', 409, 'BOOKING_RATE');
+      }
+    }
+  }
+  doc.walletAcceptedAt = existing?.walletAcceptedAt || existing?.createdAt || now;
+  const previous = existing ? await Winning.find({ bookingId: existing._id }).select('resultId').session(session).lean() : [];
+  const days = [...new Set([billDate(doc), ...(existing ? [billDate(existing)] : [])])].map(day => new Date(`${day}T00:00:00Z`));
+  const oldDraws = (existing?.rows || []).map(rowType).filter(Boolean).map(t => t.draw);
+  await Result.updateMany({ walletAuthorizedAt: { $ne: null }, $or: [
+    { date: { $in: days }, drawCode: { $in: [...draws, ...oldDraws] } },
+    { _id: { $in: previous.map(w => w.resultId) } },
+  ] }, { $set: { walletPending: true }, $inc: { walletResultRevision: 1 } }, { session });
+  if (!account?.enabled) return;
   const oldDebit = existing?.walletDebitPaise || 0;
   const oldBase = existing?.walletTracked ? (existing.walletBasePaise || 0) :
     (existing ? existing.rows.reduce((sum, row) => sum + Math.round(Number(row.amount) * 100), 0) : 0);
   const debit = doc.deletedAt ? 0 : Math.max(0, amountPaise - oldBase);
   const difference = debit - oldDebit;
-  if (difference > account.balancePaise) {
+  if (difference > 0 && difference > account.balancePaise) {
     throw error(`Insufficient wallet balance. Available ₹${(account.balancePaise / 100).toFixed(2)}.`, 409, 'WALLET_BALANCE');
   }
   if (difference) {

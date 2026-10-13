@@ -46,3 +46,36 @@ Android implementation.
 
 Run server checks with `node --test test/dailyBookingLimit.test.js test/wallet.test.js`.
 The tests use a disposable local MongoDB replica set, never real user balances.
+
+## Automatic winnings
+
+Only results synced by an active database ADMIN authorize money credits. Customer
+web fetching continues locally, but its result uploads cannot change financial
+results. The server matches each user's recorded pre-draw bookings to the same
+business date and draw. It uses the app's unified DEAR1 price-list rules: A/B/C,
+AB/BC/AC, SUPER prize tiers and compliments, and first-prize-only normal BOX.
+SET BOX is already expanded into SUPER rows by the booking parser and is not
+expanded again. Configured Win + Super amounts are included exactly as in the
+winning report. Price rows are fixed on the bill's first settlement.
+
+Winnings are a separate balance component: available = total credit + winnings
+- net booked. Winning credits activate a wallet even if it had no earlier top-up.
+Each bill/draw has a unique durable WalletWinning record. Account, settlement and
+ledger changes commit in one transaction, serialized with booking and credit
+changes. Retried result uploads, multiple server workers and reloads cannot pay
+the same win twice. Partial results add only the newly due difference. Corrections,
+explicit result deletion and admin bill deletion reconcile the difference; if
+previous winnings were already spent, a negative balance is retained and new
+bookings require more credit. Retention cleanup does not claw back winnings.
+
+The pending result flag survives server restarts and is retried every 30 seconds;
+result and booking mutations also trigger it immediately. A concurrent mutation
+increments the result revision so it cannot be accidentally marked processed by
+an older pass. WalletWinning records are included in the capped daily backup.
+New booking acceptance times come from the server. Closed-draw customer edits,
+deletion and backdated new bookings are rejected, and charged amounts are checked
+against server price/rate settings. Pre-existing bills retain their original
+recorded acceptance time; new admin bills accepted after cutoff do not earn prizes.
+
+Run all financial checks with `node --test test/dailyBookingLimit.test.js
+test/wallet.test.js test/walletWinnings.test.js` (one command line).

@@ -9,6 +9,10 @@ const resultSchema = new mongoose.Schema(
     manualOverride: { type: Boolean, default: false },
     updatedBy: { type: String, default: null },
     deletedAt: { type: Date, default: null },
+    walletAuthorizedAt: { type: Date, default: null },
+    walletResultRevision: { type: Number, default: 0 },
+    walletSettlementRevision: { type: Number, default: 0 },
+    walletPending: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

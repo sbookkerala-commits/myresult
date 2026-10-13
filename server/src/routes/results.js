@@ -1,8 +1,12 @@
 const express = require('express');
 const Result = require('../models/Result');
+const User = require('../models/User');
+const mongoose = require('mongoose');
+const { settlePendingWinnings } = require('../services/walletWinnings');
+const { HOURS, dateKey } = require('../services/winningRules');
 const ChartArchive = require('../models/ChartArchive');
 const { authRequired } = require('../middleware/auth');
-const { retentionCutoff, startOfDay } = require('../utils/dates');
+const { retentionCutoff } = require('../utils/dates');
 const { parseLimit, parseSkip } = require('../utils/queryLimits');
 const { logError } = require('../utils/logger');
 
@@ -41,14 +45,24 @@ router.get('/', authRequired, async (req, res) => {
 router.post('/', authRequired, async (req, res) => {
   try {
     const body = req.body || {};
-    const drawCode = (body.drawCode || '').trim();
-    const day = startOfDay(body.date ? new Date(body.date) : new Date());
-    if (!drawCode) {
-      return res.status(400).json({ error: 'drawCode required' });
+    const drawCode = (body.drawCode || '').trim().toUpperCase();
+    const dayKey = body.date ? dateKey(body.date) : dateKey(new Date(Date.now() + 330 * 60000));
+    const day = new Date(`${dayKey}T00:00:00Z`);
+    if (!HOURS[drawCode] || !Number.isFinite(day.getTime())) {
+      return res.status(400).json({ error: 'Valid drawCode and date required' });
     }
 
-    const prizes = Array.isArray(body.prizes) ? body.prizes : [];
-    const compliments = Array.isArray(body.compliments) ? body.compliments : [];
+    const actor = await User.findOne({ username: req.user.username, role: 'ADMIN', deletedAt: null, isBlocked: false }).lean();
+    // Customer devices may still fetch web results locally. They cannot change
+    // the authoritative result used to credit money, including with a stale JWT.
+    if (!actor) return res.json({ skipped: true, reason: 'Admin result sync required' });
+
+    const prizes = Array.isArray(body.prizes) ? body.prizes.map(String) : [];
+    const compliments = Array.isArray(body.compliments) ? body.compliments.map(String) : [];
+    if (prizes.length > 5 || compliments.length > 30 || [...prizes, ...compliments].some(n => n !== '---' && !/^\d{3,6}$/.test(n))) {
+      return res.status(400).json({ error: 'Invalid result numbers' });
+    }
+    if (prizes[0] && prizes[0] !== '---') prizes[0] = prizes[0].slice(-3);
     const manualOverride = body.manualOverride === true;
 
     const existing = await Result.findOne({ drawCode, date: day, deletedAt: null }).lean();
@@ -63,7 +77,10 @@ router.post('/', authRequired, async (req, res) => {
       });
     }
 
-    const saved = await Result.findOneAndUpdate(
+    const saved = await mongoose.connection.transaction(async session => {
+      const current = await Result.findOne({ drawCode, date: day, deletedAt: null }).session(session);
+      if (current?.manualOverride && !manualOverride) return current;
+      return Result.findOneAndUpdate(
       { drawCode, date: day },
       {
         $set: {
@@ -74,10 +91,15 @@ router.post('/', authRequired, async (req, res) => {
           manualOverride,
           updatedBy: req.user.username,
           deletedAt: null,
+          walletAuthorizedAt: new Date(),
+          walletPending: true,
         },
+        $inc: { walletResultRevision: 1 },
       },
-      { upsert: true, new: true }
-    );
+      { upsert: true, new: true, session }
+      );
+    });
+    void settlePendingWinnings();
 
     // Permanent chart archive (never deleted by retention)
     await ChartArchive.findOneAndUpdate(
@@ -87,8 +109,8 @@ router.post('/', authRequired, async (req, res) => {
           drawCode,
           date: day,
           drawLabel: body.drawLabel || drawCode,
-          prizes,
-          compliments,
+          prizes: saved.prizes,
+          compliments: saved.compliments,
           archivedBy: req.user.username,
           meta: body.meta || {},
         },
@@ -111,10 +133,13 @@ router.post('/', authRequired, async (req, res) => {
 
 router.delete('/:drawCode/:date', authRequired, async (req, res) => {
   try {
+    if (!await User.exists({ username: req.user.username, role: 'ADMIN', deletedAt: null, isBlocked: false })) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
     const drawCode = (req.params.drawCode || '').trim().toUpperCase();
-    const day = startOfDay(new Date(req.params.date));
-    if (!drawCode) {
-      return res.status(400).json({ error: 'drawCode required' });
+    const day = new Date(`${dateKey(req.params.date)}T00:00:00Z`);
+    if (!HOURS[drawCode] || !Number.isFinite(day.getTime())) {
+      return res.status(400).json({ error: 'Valid drawCode and date required' });
     }
 
     await Result.findOneAndUpdate(
@@ -123,9 +148,12 @@ router.delete('/:drawCode/:date', authRequired, async (req, res) => {
         $set: {
           deletedAt: new Date(),
           updatedBy: req.user.username,
+          walletPending: true,
         },
+        $inc: { walletResultRevision: 1 },
       },
     );
+    void settlePendingWinnings();
 
     res.json({ ok: true, drawCode, date: day });
   } catch (e) {

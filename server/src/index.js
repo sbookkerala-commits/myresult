@@ -36,6 +36,7 @@ const restoreRoutes = require('./routes/restore');
 const backupRoutes = require('./routes/backup');
 const walletRoutes = require('./routes/wallet');
 const { deliverPendingNotifications } = require('./services/paymentNotifications');
+const { settlePendingWinnings } = require('./services/walletWinnings');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,7 +89,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'myresult-api',
-    features: { dailyAmountLimit: 1, wallet: 1 },
+    features: { dailyAmountLimit: 1, wallet: 1, walletWinnings: 1 },
     environment: process.env.NODE_ENV || 'development',
     time: new Date().toISOString(),
     retentionDays: parseInt(process.env.RETENTION_DAYS || '20', 10),
@@ -182,9 +183,10 @@ async function start() {
 
   await connectDb();
   await ensureAdminUser();
-  const notificationTimer = setInterval(() => { void deliverPendingNotifications(); }, 30000);
+  const notificationTimer = setInterval(() => { void deliverPendingNotifications(); void settlePendingWinnings(); }, 30000);
   notificationTimer.unref();
   void deliverPendingNotifications();
+  void settlePendingWinnings();
 
   try {
     await runRetentionJob();

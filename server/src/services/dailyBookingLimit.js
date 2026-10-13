@@ -31,7 +31,7 @@ async function usedPaise(username, at, excludeId, session) {
   return bills.reduce((total, bill) => total + rowsPaise(bill.rows), 0);
 }
 
-async function saveBooking(doc, filter) {
+async function saveBooking(doc, filter, actorUsername = doc.ownerUsername) {
   const amount = rowsPaise(doc.rows);
   // Updating the same user's document serializes transactions on every server
   // instance, preventing two phones from spending the remaining limit together.
@@ -70,7 +70,7 @@ async function saveBooking(doc, filter) {
         throw error;
       }
     }
-    await applyBooking(doc, existing, user, amount, session);
+    await applyBooking(doc, existing, user, amount, session, actorUsername);
     return Booking.findOneAndUpdate(filter, { $set: doc }, { upsert: true, new: true, session });
   });
 }

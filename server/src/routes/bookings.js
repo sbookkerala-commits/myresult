@@ -9,6 +9,8 @@ const { logError } = require('../utils/logger');
 const mongoose = require('mongoose');
 const WalletAccount = require('../models/WalletAccount');
 const { lockUser, applyBooking, snapshot } = require('../services/wallet');
+const { settlePendingWinnings } = require('../services/walletWinnings');
+const { dateKey } = require('../services/winningRules');
 
 const router = express.Router();
 
@@ -73,6 +75,8 @@ router.get('/', authRequired, async (req, res) => {
 
 router.post('/', authRequired, async (req, res) => {
   try {
+    const actor = await User.findOne({ username: req.user.username, deletedAt: null }).lean();
+    if (!actor || actor.role !== req.user.role || actor.isBlocked) return res.status(403).json({ error: 'Sign in with an active account' });
     const body = req.body || {};
     const billNo = parseInt(body.billNo, 10);
     const createdAt = body.createdAt ? new Date(body.createdAt) : new Date();
@@ -81,8 +85,9 @@ router.post('/', authRequired, async (req, res) => {
     }
 
     const businessDate = body.businessDate
-      ? new Date(body.businessDate)
+      ? new Date(`${dateKey(body.businessDate)}T00:00:00Z`)
       : null;
+    if (businessDate && !Number.isFinite(businessDate.getTime())) return res.status(400).json({ error: 'Valid businessDate required' });
 
     const doc = {
       billNo,
@@ -102,6 +107,7 @@ router.post('/', authRequired, async (req, res) => {
     const existing = await Booking.findOne(upsertFilter(req, billNo)).select('username').lean();
     if (existing) doc.username = existing.username;
     const saved = await saveBooking(doc, upsertFilter(req, billNo));
+    void settlePendingWinnings();
 
     console.log(
       `[bookings] POST user=${req.user.username} role=${req.user.role} billNo=${saved.billNo}`
@@ -127,6 +133,8 @@ router.post('/', authRequired, async (req, res) => {
 /** Soft delete booking */
 router.delete('/:billNo', authRequired, async (req, res) => {
   try {
+    const actor = await User.findOne({ username: req.user.username, deletedAt: null }).lean();
+    if (!actor || actor.role !== req.user.role || actor.isBlocked) return res.status(403).json({ error: 'Sign in with an active account' });
     const billNo = parseInt(req.params.billNo, 10);
     const filter = { billNo, ...ownerFilter(req) };
     const updated = await mongoose.connection.transaction(async session => {
@@ -134,7 +142,7 @@ router.delete('/:billNo', authRequired, async (req, res) => {
       if (!existing) return null;
       const user = await lockUser(existing.username, session);
       if (existing.deletedAt) return existing;
-      const doc = { ...existing.toObject(), deletedAt: new Date() };
+      const doc = { ...existing.toObject(), ownerUsername: req.user.username, deletedAt: new Date() };
       await applyBooking(doc, existing, user, 0, session);
       return Booking.findOneAndUpdate(filter, { $set: {
         deletedAt: doc.deletedAt, walletTracked: doc.walletTracked,
@@ -142,9 +150,10 @@ router.delete('/:billNo', authRequired, async (req, res) => {
       } }, { new: true, session });
     });
     if (!updated) return res.status(404).json({ error: 'Booking not found' });
+    void settlePendingWinnings();
     res.json({ ok: true, billNo });
   } catch (e) {
-    res.status(500).json({ error: 'Delete failed' });
+    res.status(e.status || 500).json({ error: e.status ? e.message : 'Delete failed', code: e.code });
   }
 });
 
