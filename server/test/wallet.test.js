@@ -127,6 +127,104 @@ test('admin credit retries never duplicate and conflicting payload fails', async
   await assert.rejects(adminCredit('agent', 300, 'admin', 'request_12345'), { status: 409 });
   assert.equal((await Account.findOne()).balancePaise, 20000);
 });
+
+const manualBody = (extra = {}) => ({ username: 'agent', amount: 200,
+  utr: 'MANUALTEST123', requestId: 'manual_request_12345', confirmed: true, ...extra });
+const manual = body => request('/api/wallet/payments/manual', body);
+
+test('admin can credit a verified WhatsApp payment with UTR and an audit record', async () => {
+  const response = await manual(manualBody({ note: 'Received through WhatsApp' }));
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.balance, 200);
+  assert.equal(result.alreadyCredited, false);
+  const p = await Payment.findById(result.paymentId);
+  assert.equal(p.source, 'whatsapp'); assert.equal(p.status, 'approved');
+  assert.equal(p.reviewedBy, 'admin'); assert.equal(p.submittedBy, 'admin');
+  assert.ok(p.reviewedAt); assert.equal(p.reviewNote, 'Received through WhatsApp');
+  const entry = await Entry.findOne({ paymentId: p._id });
+  assert.equal(entry.actor, 'admin'); assert.equal(entry.amountPaise, 20000);
+  assert.match(entry.note, /WhatsApp payment.*MANUALTEST123/);
+  assert.equal(await Payment.countDocuments({ status: 'pending' }), 0);
+});
+
+test('screenshot-only WhatsApp payment credits once, including a different retry request', async () => {
+  const body = manualBody({ utr: '', receipt: image });
+  assert.equal((await manual(body)).status, 200);
+  const retry = await manual({ ...body, requestId: 'manual_request_second' });
+  assert.equal(retry.status, 200); assert.equal((await retry.json()).alreadyCredited, true);
+  assert.equal((await Account.findOne()).balancePaise, 20000);
+  assert.equal(await Entry.countDocuments(), 1); assert.equal(await Payment.countDocuments(), 1);
+  assert.equal((await Payment.findOne()).utrIsGenerated, true);
+  assert.equal((await manual({ ...body, username: 'other' })).status, 409);
+});
+
+test('WhatsApp verification approves an existing in-app request without a second credit', async () => {
+  const id = await payment('MANUALTEST123');
+  const response = await manual(manualBody());
+  assert.equal(response.status, 200); assert.equal((await response.json()).paymentId, id);
+  assert.equal((await Payment.findById(id)).status, 'approved');
+  await reviewPayment(id, 'admin', 'approved');
+  const retried = await manual(manualBody({ requestId: 'manual_new_request' }));
+  assert.equal((await retried.json()).alreadyCredited, true);
+  assert.equal(await Payment.countDocuments(), 1); assert.equal(await Entry.countDocuments(), 1);
+  assert.equal((await Account.findOne()).balancePaise, 20000);
+});
+
+test('legacy screenshots and new in-app submissions cannot double-credit a manual payment', async () => {
+  const id = await payment('LEGACY123456');
+  await Payment.updateOne({ _id: id }, { $unset: { receiptHash: 1 } });
+  await reviewPayment(id, 'admin', 'approved');
+  const response = await manual(manualBody({ utr: '', receipt: image }));
+  assert.equal(response.status, 200); assert.equal((await response.json()).alreadyCredited, true);
+  assert.equal((await Account.findOne()).balancePaise, 20000);
+  assert.equal(await Entry.countDocuments(), 1);
+});
+
+test('customer submissions cannot reuse a screenshot credited through WhatsApp', async () => {
+  assert.equal((await manual(manualBody({ utr: '', receipt: image }))).status, 200);
+  await Settings.create({ key: 'walletPayment', value: { phone: '0000000000', payeeName: 'Test' } });
+  const response = await request('/api/wallet/payments', {
+    amount: 200, utr: 'NEWAPP12345', receipt: image, requestId: 'customer_new_request',
+  }, 'agent');
+  assert.equal(response.status, 409);
+  assert.equal((await Account.findOne()).balancePaise, 20000);
+  assert.equal(await Payment.countDocuments(), 1);
+});
+
+test('concurrent duplicate UTR across two wallets credits exactly one wallet', async () => {
+  const responses = await Promise.all([
+    manual(manualBody()),
+    manual(manualBody({ username: 'other', requestId: 'other_manual_request' })),
+  ]);
+  assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+  assert.equal(await Account.countDocuments(), 1); assert.equal(await Entry.countDocuments(), 1);
+  assert.equal((await Account.findOne()).balancePaise, 20000);
+});
+
+test('manual payment rejects invalid, unconfirmed, rejected and conflicting credit requests', async () => {
+  for (const body of [manualBody({ amount: 199.99 }), manualBody({ amount: -200 }),
+    manualBody({ amount: '200.001' }), manualBody({ utr: '' }),
+    manualBody({ confirmed: false }), manualBody({ note: 'x'.repeat(301) }),
+    manualBody({ receipt: 'invalid' }), manualBody({ username: 'admin' })]) {
+    assert.equal((await manual(body)).status, 400);
+  }
+  assert.equal(await Account.countDocuments(), 0);
+  const id = await payment('REJECTED123'); await reviewPayment(id, 'admin', 'rejected', 'Not received');
+  assert.equal((await manual(manualBody({ utr: 'REJECTED123' }))).status, 409);
+  assert.equal((await manual(manualBody())).status, 200);
+  assert.equal((await manual(manualBody({ amount: 300 }))).status, 409);
+  assert.equal((await manual(manualBody({ utr: 'CHANGED1234' }))).status, 409);
+  assert.equal((await manual(manualBody({ username: 'other', utr: 'CHANGED1234' }))).status, 409);
+  assert.equal(await Account.countDocuments(), 1);
+  assert.equal((await Account.findOne()).balancePaise, 20000);
+});
+
+test('manual payment cannot be called by a customer or a spoofed admin JWT role', async () => {
+  const response = await request('/api/wallet/payments/manual', manualBody(), 'other', 'POST', 'ADMIN');
+  assert.equal(response.status, 403);
+  assert.equal(await Payment.countDocuments(), 0); assert.equal(await Account.countDocuments(), 0);
+});
 test('push sends only to active admins, persists retry after failure, avoids duplicate success', async () => {
   const id = await payment();
   await Device.create([{ username: 'admin', token: 'admin-token-test' }, { username: 'agent', token: 'agent-token-test' }]);

@@ -141,4 +141,4 @@ async function applyBooking(doc, existing, user, amountPaise, session, actorUser
   doc.walletBasePaise = oldBase;
   doc.walletDebitPaise = debit;
 }
-module.exports = { error, money, lockUser, snapshot, adminCredit, reviewPayment, applyBooking };
+module.exports = { error, money, lockUser, snapshot, credit, adminCredit, reviewPayment, applyBooking };

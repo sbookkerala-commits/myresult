@@ -7,6 +7,7 @@ const Payment = require('../models/WalletPayment');
 const Device = require('../models/NotificationDevice');
 const { authRequired } = require('../middleware/auth');
 const { error, money, snapshot, adminCredit, reviewPayment } = require('../services/wallet');
+const { verifiedWhatsAppPayment, receiptFingerprint } = require('../services/manualWalletPayment');
 const { deliverPendingNotifications, configureCredential, credentialConfigured, messaging } = require('../services/paymentNotifications');
 const router = express.Router();
 router.use(authRequired, async (req, res, next) => {
@@ -81,6 +82,22 @@ router.post('/credit', route(async (req, res) => {
     req.user.username, key(req.body.requestId));
   res.json(snapshot(account));
 }));
+router.post('/payments/manual', route(async (req, res) => {
+  adminOnly(req);
+  if (req.body.confirmed !== true) throw error('Confirm that the payment has been received');
+  const utr = `${req.body.utr || ''}`.replace(/\s/g, '').toUpperCase();
+  if (utr && !/^[A-Z0-9]{6,40}$/.test(utr)) throw error('Enter a valid UTR / transaction reference');
+  if (req.body.note != null && (typeof req.body.note !== 'string' || req.body.note.length > 300)) {
+    throw error('Keep the payment note within 300 characters');
+  }
+  const result = await verifiedWhatsAppPayment({
+    username: `${req.body.username || ''}`.trim().toLowerCase(), amount: req.body.amount,
+    actor: req.user.username, requestKey: key(req.body.requestId), utr,
+    receipt: req.body.receipt ? receipt(req.body.receipt) : undefined,
+    note: req.body.note?.trim() || '',
+  });
+  res.json(result);
+}));
 router.post('/payments', route(async (req, res) => {
   if (req.walletUser.role === 'ADMIN') throw error('Submit a payment from a customer or agent account');
   const amountPaise = money(req.body.amount, 20000);
@@ -92,7 +109,8 @@ router.post('/payments', route(async (req, res) => {
   if (!setting?.value?.phone && !setting?.value?.upiId) throw error('Payment details have not been configured');
   let payment;
   try {
-    payment = await Payment.create({ username: req.user.username, amountPaise, utr, receipt: image, idempotencyKey: requestKey });
+    payment = await Payment.create({ username: req.user.username, amountPaise, utr, receipt: image,
+      receiptHash: receiptFingerprint(image), idempotencyKey: requestKey });
   } catch (e) {
     if (e.code !== 11000) throw e;
     payment = await Payment.findOne({ $or: [{ utr }, { username: req.user.username, idempotencyKey: requestKey }] });
@@ -107,7 +125,7 @@ router.get('/payments/:id/receipt', route(async (req, res) => {
   const payment = await Payment.findById(req.params.id).select('+receipt').lean();
   if (!payment) throw error('Payment not found', 404);
   if (payment.username !== req.user.username) adminOnly(req);
-  res.json({ receipt: payment.receipt });
+  res.json({ receipt: payment.receipt || null });
 }));
 router.post('/payments/:id/review', route(async (req, res) => {
   adminOnly(req);

@@ -89,7 +89,7 @@ app.get('/health', (_, res) =>
   res.json({
     ok: true,
     service: 'myresult-api',
-    features: { dailyAmountLimit: 1, wallet: 1, walletWinnings: 1 },
+    features: { dailyAmountLimit: 1, wallet: 1, walletWinnings: 1, manualWalletPayment: 1 },
     environment: process.env.NODE_ENV || 'development',
     time: new Date().toISOString(),
     retentionDays: parseInt(process.env.RETENTION_DAYS || '20', 10),
